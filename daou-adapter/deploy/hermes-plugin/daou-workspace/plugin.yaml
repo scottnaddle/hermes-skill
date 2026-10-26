@@ -1,0 +1,10 @@
+name: daou-workspace
+version: "1.0"
+description: "유비온봇(daou 프로필) 전용: 파일 쓰기를 방별 작업 폴더(/var/lib/hermes-daou-work/<room>/)와 프로필 skills/ 안으로 제한하고, 쓰기마다 어댑터 승인을 거치게 함. 문서 생성 도구(docx/hwpx/pdf/pptx) 제공."
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_gateway_dispatch
+  - pre_llm_call
+provides_tools:
+  - daou_make_document

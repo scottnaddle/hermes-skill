@@ -1,0 +1,6 @@
+name: daou-mac
+version: "1.0"
+description: "유비온봇(daou 프로필) → 맥스튜디오 콘텐츠 작업자(ubion-content Hermes, tailscale API) 위임: 음성·받아쓰기·숏폼·이미지·영상 편집·hwpx·로컬 LLM. 결과 파일은 scp로 방 작업 폴더 mac-<job>/ 에 가져옴."
+provides_tools:
+  - daou_mac_content
+  - daou_mac_status
