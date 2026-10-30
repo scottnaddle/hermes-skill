@@ -12,10 +12,12 @@ are built by ``daou_make_document`` from structured blocks, never from code.
 
 from __future__ import annotations
 
-SESSION_REV = "2026-10-26-ab-parity-fixes-l3"
+SESSION_REV = "2026-10-31-shiraki-styles"
 
 import json
 import logging
+import subprocess
+import shlex
 import os
 import re
 from pathlib import Path
@@ -53,7 +55,7 @@ _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9가-힣_.\- ]+$")
 
 WRITE_TOOLS = {"write_file", "patch", "daou_make_document"}
 READ_TOOLS = {"read_file", "search_files"}
-DOC_FORMATS = {"docx", "hwpx", "pdf", "pptx"}
+DOC_FORMATS = {"docx", "hwpx", "pdf", "pptx", "xlsx"}
 MAX_DOC_BYTES = 20 * 1024 * 1024
 # read_file on these lazily installs Hermes' "doc-extract" extra (tools/read_extract.py → pm
 # ensure_import), which commits a PM-managed venv for the whole install; on 2026-10-23 that venv's
@@ -200,6 +202,15 @@ def pre_tool_call(tool_name: str = "", args: dict | None = None, session_id: str
             _inject_theme_into_args(a, session_id or "")
             _inject_style_into_args(a, session_id or "")
             _inject_slide_extras_into_args(a, session_id or "")
+            _dt = _resolve_docx_template(a, session_id or "")
+            if _dt and a.get("template") != _dt:
+                a["template"] = _dt
+            _xt = _resolve_xlsx_template(a, session_id or "")
+            if _xt and a.get("template") != _xt:
+                a["template"] = _xt
+            _ht = _resolve_hwpx_template(a, session_id or "")
+            if _ht and a.get("template") != _ht:
+                a["template"] = _ht
         return _decide(tool_name, a, session_id or "")
     except Exception as e:  # fail closed for anything we gate
         logger.warning("daou-workspace: guard error for %s: %s", tool_name, e)
@@ -521,6 +532,13 @@ def _ppt_brand_ids() -> list[str]:
     return sorted(_load_ppt_brand_index().keys())
 
 
+_PPT_BRAND_KO_ALIASES = {
+    "중국电信": "中国电信", "중국전신": "中国电信", "차이나텔레콤": "中国电信", "chinatelecom": "中国电信", "china-telecom": "中国电信",
+    "중국电建": "中国电建", "중국전건": "中国电建", "파워차이나": "中国电建", "powerchina": "中国电建",
+    "중汽研": "中汽研", "중기연": "中汽研", "catarc": "中汽研",
+}
+
+
 def _lookup_ppt_brand_id(raw: str) -> str | None:
     """Case-insensitive ASCII match; exact match for non-ASCII keys (중국电信 등)."""
     if not raw:
@@ -528,6 +546,10 @@ def _lookup_ppt_brand_id(raw: str) -> str | None:
     idx = _load_ppt_brand_index()
     if raw in idx:
         return raw
+    # SESSION_REV=2026-10-26-brand-ko-alias: Korean/mixed spellings of CJK brand ids
+    _ko = _PPT_BRAND_KO_ALIASES.get(re.sub(r"\s+", "", raw).lower())
+    if _ko and _ko in idx:
+        return _ko
     low = raw.lower()
     for k in idx:
         if k.lower() == low:
@@ -584,10 +606,8 @@ def _parse_brand_design_spec(spec_path: Path, brand_id: str, index_meta: dict | 
     # Brand display name
     bm = re.search(r"\|\s*Brand Name\s*\|\s*([^|]+)\|", text, flags=re.I)
     brand_name = (bm.group(1).strip() if bm else brand_id)
-    if brand_id == "ubion":
-        footer = "유비온  ·  사내 안내"
-    else:
-        footer = f"{brand_name}  ·  Presentation"
+    # 유비온봇: palette/brand_name from theme brand; footer/wordmark chrome ALWAYS Ubion
+    footer = "유비온  ·  사내 안내"
 
     return {
         "primary": field,
@@ -632,7 +652,7 @@ def _load_ppt_brand_palette(brand_id: str) -> dict | None:
             "accent": pc,
             "dark_primary": _darken_hex(pc),
             "brand_id": brand_id,
-            "footer": f"{brand_id}  ·  Presentation",
+            "footer": "유비온  ·  사내 안내",  # wordmark always Ubion
             "brand_name": brand_id,
             "index_primary": pc,
             "spec_primary": pc,
@@ -665,6 +685,9 @@ def _normalize_theme_slug(raw) -> str | None:
         s = s.lower().replace("_", "-").strip()
     else:
         s = s.replace("_", "-").strip()
+    _sh = _shiraki_slug(s)  # SHIRAKI-THEME-ALIAS: picker tab sends theme=shiraki-NNN → treated as style
+    if _sh:
+        return _sh
     if s in _HUASHU_THEME_ALIASES:
         return _HUASHU_THEME_ALIASES[s]
     if s in _HUASHU_PPT_THEMES:
@@ -762,6 +785,126 @@ def _pptx_open_presentation(pal: dict):
 
 
 # --- style= resolve (SESSION_REV=2026-10-25-style-family-router) ------------------------------
+# --- SHIRAKI-STYLES (SESSION_REV=2026-10-31-shiraki-styles) -----------------------------------
+# style=shiraki-NNN (shiraki-3 | shiraki-003 | shiraki003) → shiraki.design NotebookLM style YAML used as
+# AUTHORITATIVE design spec for OpenCode Path A (inlined into PROMPT.md; the hop never reads LMS paths).
+# palette=brand swaps the YAML Color Palette for the theme brand palette. Legacy engine → corporate family.
+_SHIRAKI_DIR = os.environ.get("DAOU_SHIRAKI_DIR") or "/opt/ubm-template-gate/shiraki"
+_SHIRAKI_SLUG_RE = re.compile(r"shiraki-?0*(\d{1,4})")
+_SHIRAKI_INDEX_CACHE: dict = {}
+# Scott's standing rule: every Path A deck uses the real Ubion logo (uploaded to <job>/assets/ on the hop).
+_UBION_LOGO_DIR = os.environ.get("DAOU_UBION_LOGO_DIR") or "/opt/ubm-template-gate/ubion-logo"
+_UBION_LOGO_FILES = ("logo-coursemos-ubion.png", "logo-coursemos-ubion-dark.png")
+
+
+def _shiraki_slug(s) -> str | None:
+    m = _SHIRAKI_SLUG_RE.fullmatch(str(s or "").strip().lower().replace("_", "-"))
+    return f"shiraki-{int(m.group(1)):03d}" if m else None
+
+
+def _shiraki_index() -> dict:
+    p = os.path.join(_SHIRAKI_DIR, "index.json")
+    try:
+        mt = os.path.getmtime(p)
+    except OSError:
+        return {}
+    if _SHIRAKI_INDEX_CACHE.get("mt") != mt:
+        try:
+            with open(p, encoding="utf-8") as fh:
+                data = json.load(fh)
+            _SHIRAKI_INDEX_CACHE.clear()
+            _SHIRAKI_INDEX_CACHE.update({"mt": mt, "by_id": {e["id"]: e for e in data.get("styles") or []}})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("daou-workspace: shiraki index load failed: %s", e)
+            return {}
+    return _SHIRAKI_INDEX_CACHE.get("by_id") or {}
+
+
+def _shiraki_range_msg() -> str:
+    ids = sorted(_shiraki_index())
+    if not ids:
+        return "shiraki 스타일 목록을 읽을 수 없습니다"
+    return f"유효 범위: style=shiraki-{ids[0]} ~ shiraki-{ids[-1]} ({len(ids)}개, 예: shiraki-3 / shiraki-003)"
+
+
+def _shiraki_spec(style_v) -> tuple[str, dict] | None:
+    """(yaml_text, index_entry) for style=shiraki-NNN, or None (not shiraki / unknown number)."""
+    slug = _shiraki_slug(style_v)
+    if not slug:
+        return None
+    sid = slug.split("-", 1)[1]
+    ent = _shiraki_index().get(sid)
+    if not ent:
+        return None
+    try:
+        with open(os.path.join(_SHIRAKI_DIR, ent.get("yaml") or f"{sid}.yaml"), encoding="utf-8") as fh:
+            y = fh.read().strip()
+    except OSError:
+        return None
+    return y, ent
+
+
+def _ubion_logo_paths() -> list[str]:
+    return [os.path.join(_UBION_LOGO_DIR, f) for f in _UBION_LOGO_FILES if os.path.isfile(os.path.join(_UBION_LOGO_DIR, f))]
+
+
+def _pptx_force_theme_fonts(path: str, font: str = "S-Core Dream") -> bool:
+    """Set theme major/minor latin+ea (+cs) typefaces to `font` (in place). Never raises."""
+    import zipfile
+    import tempfile as _tf
+    try:
+        zin = zipfile.ZipFile(path)
+        names = [n for n in zin.namelist() if re.match(r"ppt/theme/theme\d+\.xml$", n)]
+        if not names:
+            return False
+        fd, tmp = _tf.mkstemp(suffix=".pptx", dir=os.path.dirname(path) or None)
+        os.close(fd)
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for it in zin.infolist():
+                data = zin.read(it.filename)
+                if it.filename in names:
+                    x = data.decode("utf-8")
+                    def _fix(m):
+                        blk = m.group(0)
+                        blk = re.sub(r'(<a:(?:latin|ea|cs)\b[^>]*?\btypeface=")[^"]*(")', r"\g<1>" + font + r"\g<2>", blk)
+                        return blk
+                    x = re.sub(r"<a:(majorFont|minorFont)>.*?</a:\1>", _fix, x, flags=re.S)
+                    data = x.encode("utf-8")
+                zout.writestr(it, data)
+        zin.close()
+        os.replace(tmp, path)
+        os.chmod(path, 0o644)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("daou-workspace: theme font force failed: %s", e)
+        return False
+
+
+def _shiraki_addendum(yaml_text: str, ent: dict, palette_v: str, theme_v: str) -> str:
+    pal_line = "Use the YAML Color Palette as-is (original shiraki colors; NOT the Ubion navy/teal default)."
+    if (palette_v or "").strip().lower() == "brand":
+        try:
+            _slug, bp = _resolve_pptx_theme(theme_v)
+        except Exception:  # noqa: BLE001
+            bp = dict(_UBION_BRAND_PALETTE)
+        prim = "#" + str(bp.get("primary") or "04337B").lstrip("#")
+        acc = "#" + str(bp.get("accent") or "0D8782").lstrip("#")
+        dark = "#" + str(bp.get("dark_primary") or bp.get("primary") or "032558").lstrip("#")
+        pal_line = (f"palette=brand: IGNORE the YAML Color Palette main/accent colors and use ONLY the brand palette "
+                    f"main {prim} / accent {acc} / dark {dark}; keep the YAML neutrals (backgrounds, whites, near-black text). "
+                    f"Any YAML element colored with a main/accent color uses {prim} or {acc} instead. Keep ALL YAML "
+                    "layout rules, shapes, components, decorations and mood.")
+    return (
+        f"DESIGN SPEC shiraki.design No.{ent.get('id')} \"{ent.get('name')}\" ({ent.get('category')}) — AUTHORITATIVE for "
+        "palette, typography, layout, components and decorations; it overrides any default palette/style above.\n"
+        f"{pal_line}\n"
+        "Font: every text element font-family \"S-Core Dream\" (headings weight 800–900, body 400–500) for Korean AND Latin. No other font.\n"
+        "Photos: none available — use flat vector shapes / color blocks / circles where the YAML asks for photos or images.\n"
+        "Where the YAML says Japanese title/text, write Korean.\n"
+        f"===== BEGIN DESIGN SPEC YAML =====\n{yaml_text}\n===== END DESIGN SPEC YAML =====\n"
+    )
+
+
 def _normalize_style_slug(raw) -> str | None:
     if raw is None:
         return None
@@ -774,6 +917,9 @@ def _normalize_style_slug(raw) -> str | None:
     s = s.lower().replace("_", "-").strip().rstrip(".,;:)]}\"'")
     if not s:
         return None
+    _sh = _shiraki_slug(s)  # SHIRAKI-STYLES: shiraki-NNN passes through (validated at generation)
+    if _sh:
+        return _sh
     if s in _PPT_STYLE_ALIASES:
         s = _PPT_STYLE_ALIASES[s]
     if s in _PPT_STYLE_FAMILY:
@@ -810,13 +956,15 @@ def _apply_style_to_palette(pal: dict, style_raw) -> tuple[dict, str | None, str
     return out, sid, family
 
 
-# --- /슬라이드 key=value parse + Quick sidecar (SESSION_REV=2026-10-25-c1-quick-mac) ----
-# Messenger: `/슬라이드 theme=<brand> style=<style_id> pages=N [layout=…] [canvas=…] [engine=quick|legacy]`
+# --- /슬라이드 key=value parse (SESSION_REV=2026-10-29-remove-quick) ----
+# Messenger: `/슬라이드 theme=<brand|specimen> style=<style_id> pages=N [layout=…] [canvas=…] [engine=opencode|legacy]`
 # Parser is a general key=value dict (unknown keys ignored). Backward-compat: theme/style/pages.
-# engine default = quick (env PPT_ENGINE). Quick path skips _PPT_STYLE_FAMILY; legacy keeps it.
+# engine default = opencode (env PPT_ENGINE). Path A = OpenCode deepseek-flash + huashu HTML→export_deck_pptx.
+# theme/style = visual direction for OpenCode. engine=quick REMOVED — reject with clear error (never Mac Quick).
+# OpenCode fail → honest legacy (_write_pptx); never silent Quick.
 _SLIDE_CMD_RE = re.compile(r"/슬라이드\b", re.IGNORECASE)
 _SLIDE_KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s]+)")
-_SLIDE_KNOWN_KEYS = frozenset({"theme", "style", "pages", "layout", "canvas", "engine", "deck", "notes", "anim"})
+_SLIDE_KNOWN_KEYS = frozenset({"theme", "style", "pages", "layout", "canvas", "engine", "deck", "notes", "anim", "research", "palette"})
 _PENDING_THEME_NAME = ".pending_huashu_theme"
 _PENDING_STYLE_NAME = ".pending_huashu_style"
 _PENDING_SLIDE_KV_NAME = ".pending_slide_kv"
@@ -874,8 +1022,13 @@ def _extract_slide_style(text: object) -> str | None:
 def _extract_slide_engine(text: object) -> str | None:
     kv = _parse_slide_kv(text)
     raw = (kv.get("engine") or "").strip().lower()
-    if raw in ("quick", "legacy"):
-        return raw
+    if raw in ("opencode", "patha", "huashu"):
+        return "opencode"
+    if raw == "legacy":
+        return "legacy"
+    if raw == "quick":
+        # Removed 2026-10-29: surface as rejected_quick for callers that check
+        return "rejected_quick"
     return None
 
 
@@ -923,28 +1076,46 @@ def _read_pending_slide_kv(session_or_chat_id: str, *, consume: bool = False) ->
 
 
 def _resolve_ppt_engine(params: dict | None = None, session_id: str = "") -> str:
-    """quick (default) | legacy. Order: tool arg → pending kv → env PPT_ENGINE → quick."""
+    """opencode (default Path A) | legacy | rejected_quick. Order: tool arg → pending kv → env PPT_ENGINE → opencode.
+    engine=quick is NEVER a runnable path (SESSION_REV=2026-10-29-remove-quick)."""
+    def _norm(e: str) -> str | None:
+        e = (e or "").strip().lower()
+        if e in ("opencode", "patha", "huashu"):
+            return "opencode"
+        if e == "legacy":
+            return "legacy"
+        if e == "quick":
+            return "rejected_quick"
+        if e == "rejected_quick":
+            return "rejected_quick"
+        return None
     if isinstance(params, dict):
-        e = str(params.get("engine") or "").strip().lower()
-        if e in ("quick", "legacy"):
-            return e
-    sid = _normalize_daou_session_id(session_id) if session_id else ""
-    if sid:
-        kv = _read_pending_slide_kv(sid, consume=False)
-        e = str(kv.get("engine") or "").strip().lower()
-        if e in ("quick", "legacy"):
-            return e
-    if isinstance(params, dict):
-        path = _resolve(params.get("path")) if params.get("path") else None
-        if path and _under(path, WORK_ROOT):
-            room = os.path.basename(os.path.dirname(path))
+        n = _norm(str(params.get("engine") or ""))
+        if n:
+            return n
+    if session_id:
+        kv = _read_pending_slide_kv(session_id, consume=False) or {}
+        n = _norm(str(kv.get("engine") or ""))
+        if n:
+            return n
+        try:
+            room = None
+            m_sid = _SESSION_RE.match(session_id or "")
+            if m_sid:
+                room = m_sid.group(1)
             if room:
-                kv = _read_pending_slide_kv(f"daou_{room}_x", consume=False)
-                e = str(kv.get("engine") or "").strip().lower()
-                if e in ("quick", "legacy"):
-                    return e
-    env = (os.environ.get("PPT_ENGINE") or "quick").strip().lower()
-    return env if env in ("quick", "legacy") else "quick"
+                kv = _read_pending_slide_kv(f"daou_{room}_x", consume=False) or {}
+                n = _norm(str(kv.get("engine") or ""))
+                if n:
+                    return n
+        except Exception:
+            pass
+    env_raw = (os.environ.get("PPT_ENGINE") or "opencode").strip().lower()
+    if env_raw == "quick":
+        logger.warning("daou-workspace: PPT_ENGINE=quick ignored (removed); using opencode")
+        return "opencode"
+    env = _norm(env_raw)
+    return env or "opencode"
 
 
 def _huashu_sm_quick_remap(theme_raw) -> dict | None:
@@ -982,11 +1153,13 @@ def _huashu_sm_quick_remap(theme_raw) -> dict | None:
 
 
 def _effective_ppt_engine(params: dict | None = None, session_id: str = "") -> str:
-    """Like _resolve_ppt_engine, with Huashu routing:
+    """Resolve ppt engine with OpenCode Path A default (SESSION_REV=2026-10-29-remove-quick).
 
-    - editorial/longform specimens (17-…) → keep Quick for SM dark editorial remap
-    - other Huashu specimens → force legacy (Huashu DNA)
-    - brand_id (中国电信/ubion/…) → unchanged Quick/legacy from resolve
+    - default / engine=opencode|patha|huashu → OpenCode + huashu HTML→export_deck_pptx (Path A)
+    - explicit engine=quick → rejected_quick (clear error; never Mac Quick sidecar)
+    - explicit engine=legacy → LMS _write_pptx
+    - OpenCode fail → honest legacy only (never silent Quick)
+    - theme/style are visual direction for OpenCode
     """
     eng = _resolve_ppt_engine(params, session_id)
     theme_raw = None
@@ -997,25 +1170,18 @@ def _effective_ppt_engine(params: dict | None = None, session_id: str = "") -> s
             theme_raw = _read_pending_theme(session_id, consume=False)
         except Exception:
             theme_raw = None
-    if _huashu_sm_quick_remap(theme_raw):
-        # Stay on Quick so Mac can render editorial_bleed dark (SM parity)
-        if eng == "legacy" and str((params or {}).get("engine") or "").strip().lower() != "legacy":
-            # pending/env said legacy but theme wants SM remap — only honor explicit tool engine=legacy
-            pass
+    if eng in ("quick", "rejected_quick"):
+        logger.info("daou-workspace: engine=quick rejected (removed %s)", SESSION_REV)
+        return "rejected_quick"
+    if eng == "legacy":
+        return "legacy"
+    # opencode Path A — specimen theme is visual direction, not legacy force
+    if _is_huashu_specimen_theme(theme_raw):
         logger.info(
-            "daou-workspace: huashu editorial theme=%s → Quick SM-remap (dark editorial_bleed)",
+            "daou-workspace: huashu specimen theme=%s → opencode Path A (visual direction)",
             _normalize_theme_slug(theme_raw),
         )
-        return "quick" if str((params or {}).get("engine") or "").strip().lower() != "legacy" else "legacy"
-    if _is_huashu_specimen_theme(theme_raw):
-        if eng != "legacy":
-            logger.info(
-                "daou-workspace: huashu specimen theme=%s → force engine=legacy (was %s)",
-                _normalize_theme_slug(theme_raw),
-                eng,
-            )
-        return "legacy"
-    return eng
+    return "opencode"
 
 
 def _inject_slide_extras_into_args(args: dict, session_id: str = "") -> dict:
@@ -1031,7 +1197,7 @@ def _inject_slide_extras_into_args(args: dict, session_id: str = "") -> dict:
             if room:
                 kv = _read_pending_slide_kv(f"daou_{room}_x", consume=False)
     applied = {}
-    for key in ("layout", "canvas", "engine", "pages", "deck"):
+    for key in ("layout", "canvas", "engine", "pages", "deck", "palette"):
         if key in args and args.get(key) not in (None, ""):
             continue
         if key in kv and kv[key] not in (None, ""):
@@ -1046,6 +1212,164 @@ def _inject_slide_extras_into_args(args: dict, session_id: str = "") -> dict:
     if applied:
         logger.info("daou-workspace: inject slide extras %s session=%s", applied, session_id or "?")
     return applied
+
+
+
+_THIN_REPEAT: dict = {}  # path -> (blocks sha1, count); SESSION_REV=2026-10-30-density-loop
+
+
+def _pptx_block_stats(blocks: list) -> dict:
+    """Count level-1 headings + useful body chars + Sources signal for pptx density gate."""
+    headings_l1 = 0
+    body_chars = 0
+    has_sources = False
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "heading":
+            lvl = int(b.get("level") or 1)
+            text = str(b.get("text") or "")
+            if lvl == 1:
+                headings_l1 += 1
+            if re.search(r"(?i)sources?|출처|참고\s*자료|references?", text):
+                has_sources = True
+            body_chars += len(text.strip())
+        elif t == "paragraph":
+            text = str(b.get("text") or "")
+            body_chars += len(text.strip())
+            if re.search(r"(?i)sources?|출처|https?://|www\.|참고\s*자료", text):
+                has_sources = True
+        elif t == "bullets":
+            items = b.get("items") or []
+            joined = " ".join(str(x) for x in items)
+            body_chars += len(joined.strip())
+            if re.search(r"(?i)sources?|출처|https?://|www\.", joined):
+                has_sources = True
+        elif t == "table":
+            rows = b.get("rows") or []
+            flat = " ".join(
+                str(c) for row in rows for c in (row if isinstance(row, list) else [row])
+            )
+            body_chars += len(flat.strip())
+            if re.search(r"(?i)sources?|출처|https?://", flat):
+                has_sources = True
+    return {"headings_l1": headings_l1, "body_chars": body_chars, "has_sources": has_sources}
+
+
+def _soft_reject_thin_pptx(blocks: list, pages, *, research_off: bool = False) -> dict | None:
+    """Soft-reject thin / title-only pptx blocks so the model can retry with denser content.
+
+    SESSION_REV=2026-10-26-slide-research-dense: replaces invent-from-title fallback.
+    Returns an error payload dict, or None when OK.
+    """
+    try:
+        pages_n = int(pages) if pages is not None and str(pages).strip() != "" else None
+    except (TypeError, ValueError):
+        pages_n = None
+    stats = _pptx_block_stats(blocks)
+    h = stats["headings_l1"]
+    body = stats["body_chars"]
+    if not blocks or (h == 0 and body < 80):
+        return {
+            "success": False,
+            "error": (
+                "daou_make_document soft-reject: blocks empty/title-only. "
+                "Do NOT invent from title. Research (wiki or web_search+web_extract≥2), "
+                "then pass ≥pages level-1 headings with dense body (~120+ chars/page) and a Sources section."
+            ),
+            "code": "thin_blocks",
+            "pages": pages_n,
+            **stats,
+        }
+    if pages_n is None or pages_n <= 1:
+        return None
+    min_body = max(120 * pages_n, 200)
+    problems = []
+    if h < pages_n:
+        problems.append(f"headings_l1={h} < pages={pages_n}")
+    if body < min_body:
+        problems.append(f"body_chars={body} < min={min_body} (~120/page)")
+    if not research_off and not stats["has_sources"] and pages_n >= 3:
+        problems.append("missing Sources/출처 (or URL) section after research")
+    if not problems:
+        return None
+    return {
+        "success": False,
+        "error": (
+            f"daou_make_document soft-reject: blocks insufficient for pages={pages_n} "
+            f"({'; '.join(problems)}). "
+            f"HARD: exactly {pages_n} level-1 headings (one slide each), ≥{min_body} useful body chars, "
+            "Sources section required when research ran. "
+            + (f"FIX: you sent only {h} slide(s) — put ALL {pages_n} slides in ONE blocks array "
+               f"(each slide = heading level:1 + its paragraph/bullets/table; Sources/출처 paragraph with URLs in the last slide). "
+               "Research is already done — do NOT research again and do NOT resend the same arguments. "
+               if h < pages_n else "Add concrete facts per slide (web_extract≥2 or wiki if research is missing), then retry. ")
+            + 
+            "Do NOT invent from title; do NOT call make_document with slogan-only blocks."
+        ),
+        "code": "thin_blocks",
+        "pages": pages_n,
+        "min_body": min_body,
+        **stats,
+    }
+
+
+def _expand_structure_for_pages(struct: list, pages_v: int) -> list:
+    """Expand a 3-beat style recipe to exactly pages_v entries (or trim if shorter)."""
+    base = [str(x) for x in (struct or []) if str(x).strip()]
+    try:
+        n = int(pages_v)
+    except (TypeError, ValueError):
+        return base
+    if n <= 0:
+        return base
+    if not base:
+        return [f"content_{i+1}" for i in range(n)]
+    if n <= len(base):
+        return base[:n]
+    out = list(base)
+    mid = base[1:-1] if len(base) >= 3 else (base[1:] or ["title_content", "two_content", "table_summary"])
+    if not mid:
+        mid = ["title_content", "two_content", "kpi_dashboard"]
+    i = 0
+    while len(out) < n:
+        out.insert(-1, f"{mid[i % len(mid)]}_extra{i+1}")
+        i += 1
+    return out
+
+
+def _pages_aware_recipe_brief(style_v: str, recipe: dict | None, pages_v: int) -> str:
+    """Rewrite style recipe brief so pages=N is HARD (never collapse to pages=3 roster)."""
+    recipe = recipe or {}
+    base_brief = (recipe.get("brief") or (
+        f"STYLE RECIPE {style_v}: install style root; pick a DISTINCT layout roster vs other styles."
+    ))
+    if pages_v != 3:
+        base_brief = re.sub(r"(?i)for pages=3[^.]*\.", f"For pages={pages_v} expand the recipe. ", base_brief)
+        base_brief = re.sub(r"(?i)pages=3:", f"pages={pages_v}:", base_brief)
+        base_brief = re.sub(
+            r"(?i)SHAPE BUDGET HARD:[^.]*\.",
+            f"SHAPE BUDGET: author exactly {pages_v} SVGs/slides (do not clone only the 3-page reference set). ",
+            base_brief,
+        )
+        # Drop 3-SVG clone instructions that fight pages=N expansion
+        base_brief = re.sub(
+            r"(?i)Clone \$HERMES_SKILL_DIR/reference-svg/[^\n]*",
+            f"Author {pages_v} SVGs from style prototypes (do not stop at the 3 reference SVGs).",
+            base_brief,
+        )
+        base_brief = re.sub(
+            r"(?i)python-pptx shape_counts MUST be 5/10/10\.?",
+            f"shape_counts scale with {pages_v} pages; prioritize readable dense body over 5/10/10.",
+            base_brief,
+        )
+    hard = (
+        f"HARD pages={pages_v}: produce EXACTLY {pages_v} slides — no fewer, no collapse to a 3-page recipe. "
+        f"Each level-1 heading in the brief MUST become its own slide. "
+        f"Dense body: ≥~120 useful chars per content slide (tables/bullets/numbers OK)."
+    )
+    return f"{base_brief.rstrip()} {hard}"
 
 
 def _blocks_to_quick_brief(title: str, blocks: list) -> str:
@@ -1109,177 +1433,551 @@ def _quick_sidecar(
     session_id: str = "",
     wait_seconds: int | None = None,
 ) -> dict | None:
-    """Post a Quick Generate slides job via daou-mac hop; copy .pptx into ``path``.
+    """REMOVED (SESSION_REV=2026-10-29-remove-quick). Never hops Mac Quick / svg_to_pptx --quick-generate.
 
-    Returns a report dict on success, or None to signal legacy ``_write_pptx`` fallback.
-    Does NOT call ``_PPT_STYLE_FAMILY`` — theme/style/layout/canvas pass through to the brief.
-    Mac skill/SOUL may be WIP: any failure/timeout/empty-out → None (fail-closed).
+    Callers must reject engine=quick before invoking; this stub is belt-and-suspenders.
+    """
+    logger.warning("daou-workspace: _quick_sidecar called but Quick removed; refusing (no Mac hop)")
+    return {
+        "error": "engine_quick_removed",
+        "engine": None,
+        "quick_fallback": True,
+        "quick_fallback_reason": "engine=quick removed; use opencode (default) or legacy",
+        "message": "engine=quick은 제거되었습니다. engine 생략(기본 OpenCode 화슈) 또는 engine=legacy만 사용하세요.",
+        "rev": SESSION_REV,
+    }
+
+
+def _opencode_ssh(cmd: str, timeout: int = 120) -> str:
+    """SSH to OpenCode hop (default VPS185; Mac Studio later via DAOU_OPENCODE_HOST)."""
+    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
+    r = subprocess.run(
+        ["ssh", "-n", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"opencode-ssh fail ({r.returncode}): {(r.stderr or r.stdout or '')[-400:]}")
+    return r.stdout or ""
+
+
+def _opencode_scp_to(local_paths: list[str], remote_dir: str, timeout: int = 120) -> None:
+    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
+    dst = f"{host}:{remote_dir.rstrip('/')}/"
+    r = subprocess.run(
+        ["scp", "-q", "-p", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", *local_paths, dst],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"opencode-scp-to fail: {(r.stderr or '')[-300:]}")
+
+
+def _opencode_scp_from(remote_path: str, local_path: str, timeout: int = 120) -> None:
+    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
+    src = f"{host}:{remote_path}"
+    r = subprocess.run(
+        ["scp", "-q", "-p", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", src, local_path],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"opencode-scp-from fail: {(r.stderr or '')[-300:]}")
+
+
+# TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): shared template checks + OpenCode orphan recovery live in
+# /opt/ubm-template-gate/ubm_template_gate.py (repo desktop/server/wizard/tools/template_gate/).
+_GATE_MOD = None
+
+
+def _gate():
+    global _GATE_MOD
+    if _GATE_MOD is None:
+        try:
+            import sys as _sys
+            _gd = os.environ.get("UBM_GATE_HOME") or "/opt/ubm-template-gate"
+            if _gd not in _sys.path:
+                _sys.path.insert(0, _gd)
+            import ubm_template_gate as _m  # type: ignore
+            _GATE_MOD = _m
+        except Exception as e:  # noqa: BLE001
+            logger.warning("daou-workspace: template gate module unavailable: %s", e)
+            _GATE_MOD = False
+    return _GATE_MOD or None
+
+
+def _company_template_dir(theme_v: str) -> str:
+    """Skill folder (SKILL.md + assets) for a company/dept slide template id, or ''."""
+    slug = re.sub(r"[^a-z0-9._-]", "", (theme_v or "").lower())
+    if not slug:
+        return ""
+    cands = [os.path.join(os.environ.get("HERMES_HOME") or "/root/.hermes/profiles/daou", "skills", "ubion-work", slug)]
+    for prof in ("daou", "slides"):
+        cands.append(f"/root/.hermes/profiles/{prof}/skills/ubion-work/{slug}")
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "SKILL.md")):
+            return c
+    g = _gate()
+    if g:
+        d = g.find_slide_skill_dir(slug)
+        if d:
+            return str(d)
+    return ""
+
+
+_PATH_A_IGNORED_LAYOUTS = {"presentation_core", "report_core"}
+
+
+def _opencode_build_prompt(
+    *, title: str, blocks: list, theme_v: str, style_v: str, pages_v: int, canvas_v: str,
+    layout_v: str, deck_v: str, remote_job: str, skill_dir: str, research_off: bool = True,
+    palette_v: str = "",
+) -> tuple[str, str, dict]:
+    """PROMPT.md for OpenCode Path A. Returns (prompt, company_template_dir, meta).
+
+    With a company/dept/design template (SKILL.md present) the SKILL is AUTHORITATIVE: its full
+    text is inlined, the files are uploaded to <job>/template/, the default navy/teal +
+    S-Core Dream text is NOT emitted, and layout=presentation_core/report_core is dropped.
+    """
+    remote_work = f"{remote_job}/work"
+    remote_pptx = f"{remote_job}/out/deck.pptx"
+    brief = _blocks_to_opencode_brief(title, blocks)
+    meta: dict = {"layout_ignored": None}
+    if (layout_v or "").strip().lower() in _PATH_A_IGNORED_LAYOUTS:
+        meta["layout_ignored"] = layout_v
+        layout_v = ""
+    ct_dir = _company_template_dir(theme_v) if not _is_huashu_specimen_theme(theme_v) else ""
+    if ct_dir:
+        try:
+            skill_text = open(os.path.join(ct_dir, "SKILL.md"), encoding="utf-8").read()
+        except OSError:
+            skill_text = ""
+        tpl = f"{remote_job}/template"
+        assets = sorted(os.listdir(os.path.join(ct_dir, "assets"))) if os.path.isdir(os.path.join(ct_dir, "assets")) else []
+        asset_lines = "\n".join(f"- {tpl}/assets/{a}" for a in assets) or "- (none)"
+        layout_v = ""
+        direction = (
+            f"COMPANY TEMPLATE `{theme_v}` — AUTHORITATIVE. Before writing any HTML, read {tpl}/SKILL.md "
+            f"(full copy below) and follow it STRICTLY: its palette/design tokens, font, fixed chrome (logo, "
+            f"section tab, footer) and slide-type layouts. Use ONLY colors from its token table. "
+            f"Reference HTML implementation: {tpl}/examples/ (copy its structure). "
+            f"Template assets (use with ABSOLUTE paths via <img>, never redraw/fake logos):\n{asset_lines}\n"
+            "Ignore any generic default palette or font you know from huashu-design; this SKILL overrides them.\n"
+            f"===== BEGIN {tpl}/SKILL.md =====\n{skill_text.strip()}\n===== END SKILL.md =====\n"
+        )
+        font_line = "Font: exactly the font named in the SKILL above (with its fallback) for all text."
+        meta["company_template"] = theme_v
+        meta["skill_sha1_16"] = __import__("hashlib").sha1(skill_text.encode("utf-8")).hexdigest()[:16]
+    elif _is_huashu_specimen_theme(theme_v):
+        direction = (
+            f"Visual direction: specimen `{theme_v}` from huashu style-specimens-ko/ppt/ (LOOK ONLY — "
+            "rewrite as 960×540 Path A HTML; do not feed specimen raw into html2pptx)."
+        )
+        font_line = ('Default font-family for all text: "S-Core Dream" (Korean+Latin; font-weight 300–800). '
+                     "Theme/specimen changes colors/layout; keep S-Core Dream unless a specimen needs a serif/mono accent.")
+    else:
+        direction = (
+            f"Brand/theme direction: `{theme_v}` with style `{style_v}`. "
+            "Default workshop palette if unspecified: navy #032558/#04337B, teal #0D8782, "
+            "DEFAULT FONT: font-family \"S-Core Dream\", \"Gothic A1\", sans-serif (installed on hop; weights 300–800), title ~56–82px, body ≥24px."
+        )
+        font_line = ('Default font-family for all text: "S-Core Dream" (Korean+Latin; font-weight 300–800). '
+                     "Theme/specimen changes colors/layout; keep S-Core Dream unless a specimen needs a serif/mono accent.")
+    # SHIRAKI-STYLES: style=shiraki-NNN → inline YAML design spec (non-company-template only); Ubion logo always.
+    _sh = None if ct_dir else _shiraki_spec(style_v)
+    if _sh:
+        direction = _shiraki_addendum(_sh[0], _sh[1], palette_v, theme_v)
+        font_line = ('Font: "S-Core Dream" for ALL text (Korean + Latin); in HTML set font-family: "S-Core Dream" on every element '
+                     "(no Gothic A1 / Malgun Gothic / Noto fallbacks in the exported pptx).")
+        meta["shiraki"] = _sh[1].get("id")
+        meta["palette"] = (palette_v or "yaml").lower()
+    if not ct_dir:
+        _logo = f"{remote_job}/assets"
+        direction += (
+            f"\nUbion logo on EVERY slide (real file via <img> with ABSOLUTE path, small, in a corner; never redraw/fake): "
+            f"{_logo}/logo-coursemos-ubion.png (light backgrounds) and {_logo}/logo-coursemos-ubion-dark.png (dark backgrounds).\n"
+        )
+        meta["ubion_logo"] = True
+    research_line = (
+        "research=off — do NOT call WebSearch/browse. General knowledge only; label soft claims honestly."
+        if research_off
+        else "You may research briefly if needed; cite Sources on a final slide when used."
+    )
+    prompt = f"""Use huashu-design on OpenCode with model deepseek/deepseek-flash.
+{direction}
+{font_line}
+Author EXACTLY {pages_v} Korean slides as 960×540pt HTML (p/h1–h3 only; no CSS gradients; no background-image; no ::before/::after text).
+Export with: cd {skill_dir} && node scripts/export_deck_pptx.mjs --slides <slides-dir> --out {remote_pptx}
+(html2pptx + pptxgenjs, LAYOUT_WIDE 13.333×7.5). Do NOT use Mac Quick, svg_to_pptx --quick-generate, or daou_make_document Quick.
+Skip three-direction gate: write direction-approved.md and proceed with ONE direction.
+{research_line}
+Work ONLY under {remote_work}/. Final pptx MUST be at {remote_pptx}.
+Topic/title: {title or 'slides'}
+style={style_v} theme={theme_v} pages={pages_v} canvas={canvas_v} layout={layout_v or '(auto)'} deck={deck_v or '(none)'}
+SESSION_REV={SESSION_REV}
+HARD: exactly {pages_v} slides; editable native text frames; Korean copy; no fake logos; no 「PPT Master」 Quick DNA / 3-card collapse.
+
+--- brief ---
+{brief or '(use title and invent dense workshop content for each slide — research_off)'}
+
+When done print one line: DONE pptx={remote_pptx} engine=opencode-patha slides={pages_v}
+Start now. No questions.
+"""
+    return prompt, ct_dir, meta
+
+
+def _blocks_to_opencode_brief(title: str, blocks: list) -> str:
+    """Serialize blocks into markdown brief for OpenCode huashu authoring."""
+    lines = []
+    if title:
+        lines.append(f"# {title}")
+        lines.append("")
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "heading":
+            lvl = int(b.get("level") or 1)
+            prefix = "#" * min(max(lvl, 1), 3)
+            lines.append(f"{prefix} {b.get('text') or ''}")
+        elif t == "paragraph":
+            lines.append(str(b.get("text") or ""))
+        elif t == "bullets":
+            for it in b.get("items") or []:
+                lines.append(f"- {it}")
+        elif t == "table":
+            rows = b.get("rows") or []
+            for i, row in enumerate(rows[:12]):
+                if isinstance(row, list):
+                    lines.append("| " + " | ".join(str(c) for c in row) + " |")
+                    if i == 0:
+                        lines.append("| " + " | ".join("---" for _ in row) + " |")
+        lines.append("")
+    return "\n".join(lines).strip()[:14000]
+
+
+def _opencode_sidecar(
+    path: str,
+    title: str,
+    blocks: list,
+    *,
+    theme: str | None = None,
+    style: str | None = None,
+    layout: str | None = None,
+    canvas: str | None = None,
+    pages: int | None = None,
+    deck: str | None = None,
+    session_id: str = "",
+    wait_seconds: int | None = None,
+    research_off: bool = True,
+    palette: str | None = None,
+) -> dict | None:
+    """Run OpenCode + huashu Path A on hop host; copy .pptx into ``path``.
+
+    SESSION_REV=2026-10-29-opencode-patha
+    Host default: VPS185 (DAOU_OPENCODE_HOST / DAOU_FALLBACK_HOST). Mac Studio later.
+    Authoring MUST be OpenCode deepseek-flash + huashu HTML → export_deck_pptx.mjs.
+    Returns report dict on success, or dict with opencode_fallback=True on failure
+    (caller should NOT silently claim Quick).
     """
     import shutil
+    import tempfile
     import time as _time
+    import uuid
 
     wait = wait_seconds
     if wait is None:
         try:
-            # Quick Generate (Mac) typically 2–6 min; smoke Walmart ~282s. 90 was too short → false legacy.
-            wait = int(os.environ.get("PPT_QUICK_WAIT", "420"))
+            wait = int(os.environ.get("PPT_OPENCODE_WAIT", "1020"))
         except ValueError:
-            wait = 420
-    wait = max(15, min(int(wait), 900))
+            wait = 1020
+    wait = max(60, min(int(wait), 1200))
 
-    try:
-        mac = _load_daou_mac_mod()
-    except Exception as e:
-        logger.warning("daou-workspace: quick sidecar cannot load daou-mac: %s", e)
-        return None
-
-    # Prefer calling the public tool handler so hop select + bg-follow stay shared.
-    room = os.path.basename(os.path.dirname(path))
-    # Synthetic session so daou-mac _room() resolves to this room folder
-    syn_sid = session_id if (session_id and getattr(mac, "_SESSION_RE").match(session_id)) else f"daou_{room}_quick1"
-    brief_body = _blocks_to_quick_brief(title, blocks)
-    # NO field drops — always wire theme/style/pages/layout/canvas (defaults match Mac skill).
     theme_v = (str(theme).strip() if theme else "") or "ubion"
     style_v = (str(style).strip() if style else "") or "workshop-teaching"
-    canvas_v = (str(canvas).strip() if canvas else "") or "ppt169"
-    layout_v = (str(layout).strip() if layout else "")  # empty → fill from style recipe
+    # SHIRAKI-THEME-ALIAS: theme=shiraki-NNN (picker tab) → style=shiraki-NNN on the Ubion brand
+    if _shiraki_slug(theme_v):
+        if not _shiraki_slug(style_v):
+            style_v = _shiraki_slug(theme_v)
+        theme_v = "ubion"
     pages_v = pages if pages is not None else 6
     try:
         pages_v = int(pages_v)
     except (TypeError, ValueError):
         pages_v = 6
-    deck_v = (str(deck).strip() if deck else "")
-    # SESSION_REV=2026-10-26-ab-parity-fixes: style → distinct SVG layout recipe
-    recipe = _quick_style_recipe(style_v)
-    recipe_layout = (recipe or {}).get("layout") or ""
-    if not layout_v and recipe_layout:
-        layout_v = recipe_layout
-    struct = (recipe or {}).get("structure_3") or []
-    protos = (recipe or {}).get("prototypes_3") or []
-    recipe_brief = (recipe or {}).get("brief") or (
-        f"STYLE RECIPE {style_v}: install style root; pick a DISTINCT layout roster vs other styles."
+    pages_v = max(1, min(pages_v, 30))
+    canvas_v = (str(canvas).strip() if canvas else "") or "ppt169"
+    layout_v = (str(layout).strip() if layout else "") or ""
+    deck_v = (str(deck).strip() if deck else "") or ""
+
+    work_root = os.environ.get("DAOU_OPENCODE_WORK") or "/root/ubion-bot-work/opencode-jobs"
+    job = f"oc-{_time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    remote_job = f"{work_root.rstrip('/')}/{job}"
+    remote_work = f"{remote_job}/work"
+    remote_out = f"{remote_job}/out"
+    remote_pptx = f"{remote_out}/deck.pptx"
+    skill_dir = os.environ.get("DAOU_OPENCODE_HUASHU") or "/root/.config/opencode/skills/huashu-design"
+    oc_bin = os.environ.get("DAOU_OPENCODE_BIN") or "/root/.local/bin/opencode"
+
+    # TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): prompt built by _opencode_build_prompt (SKILL inlined, defaults stripped)
+    prompt, _ct_dir, _pmeta = _opencode_build_prompt(
+        title=title, blocks=blocks, theme_v=theme_v, style_v=style_v, pages_v=pages_v, canvas_v=canvas_v,
+        layout_v=layout_v, deck_v=deck_v, remote_job=remote_job, skill_dir=skill_dir, research_off=research_off,
+        palette_v=(str(palette).strip() if palette else ""),
     )
-    # Huashu editorial → SM dark editorial_bleed remap (overrides style recipe layout/structure)
-    _sm = _huashu_sm_quick_remap(theme_v)
-    if _sm:
-        style_v = _sm.get("style") or style_v
-        layout_v = _sm.get("layout") or layout_v
-        struct = _sm.get("structure_3") or struct
-        protos = []
-        recipe_brief = _sm["brief"]
-        logger.info("daou-workspace: quick sidecar SM-remap huashu theme=%s layout=%s", theme_v, layout_v)
-    req_lines = [
-        "[ubion-presentation / ppt-master Quick]",
-        f"theme={theme_v}",
-        f"style={style_v}",
-        f"pages={pages_v}",
-        f"canvas={canvas_v}",
-        f"layout={layout_v or '(none)'}",
-        "engine=quick",
-        f"SESSION_REV={SESSION_REV}",
-    ]
-    if deck_v:
-        req_lines.append(f"deck={deck_v}")
-    req_lines.extend([
-        f"주제/원고: {title or 'slides'}",
-        "DNUE 금지. skill_view ubion-content/ubion-presentation 후 workflows/profiles/quick-generate.md.",
-        "Brand+Style(+Layout) workspace 설치 → SVG → svg_to_pptx --quick-generate.",
-        "Do NOT use Huashu/_PPT_STYLE_FAMILY for brand_id themes. Apply STYLE RECIPE below.",
-        recipe_brief,
-    ])
-    if struct:
-        req_lines.append("PAGE STRUCTURE (target SM parity): " + " → ".join(struct))
-    if protos:
-        req_lines.append("PROTOTYPES: " + ", ".join(protos) + " (trim layout design_spec page_count/roster to pages).")
-    req_lines.extend([
-        # Shape budget — SM baseline 5/10/10
-        "SHAPE BUDGET (workshop-teaching pages=3): target shape_counts 5/10/10; clone reference-svg/workshop-teaching/*.svg then rewrite text only; see STYLE_PAGE_RECIPES.md.",
-        # Cover logo / wordmark — SM baseline uses cover-logo + images/logo.png
-        "COVER LOGO (required when brand has images/logo.png): on cover/title_slide put "
-        '<image id="cover-logo" href="../images/logo.png" … data-pptx-role="decoration"/> '
-        "like SM (中国电信 lockup ~236×65 top-right). Do NOT ship palette-only branding with zero media.",
-        "Apply brand design_spec colors (中国电信 primary #004EA2). out/에 pptx만. "
-        "답에 절대경로+theme/style/layout/canvas/장수+logo=Y/N.",
-        "",
-        "--- brief ---",
-        brief_body or "(no blocks; invent a short Walmart-chapter-class corporate deck from the title)",
-    ])
-    request = "\n".join(req_lines) + "\n"
+    if _pmeta.get("layout_ignored") or _ct_dir:
+        layout_v = ""
+
     t0 = _time.time()
     try:
-        raw = mac.mac_content(
-            {"request": request, "wait_seconds": wait, "inputs": []},
-            session_id=syn_sid,
+        _opencode_ssh(
+            f"mkdir -p {shlex.quote(remote_work)} {shlex.quote(remote_out)} {shlex.quote(remote_job + '/assets')} && "
+            f"printf '%s\\n' 'approved' > {shlex.quote(remote_work + '/direction-approved.md')}",
+            timeout=30,
         )
-        res = json.loads(raw) if isinstance(raw, str) else raw
     except Exception as e:
-        logger.warning("daou-workspace: quick sidecar mac_content failed: %s", e)
-        return None
-    if not isinstance(res, dict) or res.get("error"):
-        logger.info("daou-workspace: quick sidecar error/fallback: %s", (res or {})[:200] if isinstance(res, str) else res)
-        err = (res or {}).get("error") if isinstance(res, dict) else res
+        logger.warning("daou-workspace: opencode hop mkdir failed: %s", e)
         return {
-            "engine": "legacy",
-            "quick_fallback": True,
-            "quick_fallback_reason": f"mac_error:{str(err)[:300]}",
-            "hop": (res or {}).get("hop") if isinstance(res, dict) else None,
-            "quick_job": (res or {}).get("job_id") if isinstance(res, dict) else None,
-            "rev": "c1-quick-wait-scp",
+            "engine": "opencode",
+            "opencode_fallback": True,
+            "opencode_fallback_reason": f"mkdir:{e}",
+            "rev": SESSION_REV,
         }
-    status = res.get("status")
-    hop = res.get("hop")
-    job_id = res.get("job_id")
-    if status != "completed":
-        # running/failed/lost → fail-closed to legacy for C1 (adapter pptx-follow not wired yet)
-        reason = f"status={status} hop={hop} job={job_id} wait_s={wait} elapsed_s={_time.time() - t0:.1f}"
-        logger.info(
-            "daou-workspace: quick sidecar %s → legacy fallback",
-            reason,
-        )
-        return {
-            "engine": "legacy",
-            "quick_fallback": True,
-            "quick_fallback_reason": reason,
-            "quick_job": job_id,
-            "hop": hop,
-            "elapsed_s": round(_time.time() - t0, 1),
-            "rev": "c1-quick-wait-scp",
-        }
-    files = res.get("files") or []
-    pptx_src = None
-    for f in files:
-        p = f.get("path") if isinstance(f, dict) else f
-        if isinstance(p, str) and p.lower().endswith(".pptx") and os.path.isfile(p):
-            pptx_src = p
-            break
-    if not pptx_src:
-        logger.info("daou-workspace: quick sidecar completed but no .pptx in files → legacy")
-        return {
-            "engine": "legacy",
-            "quick_fallback": True,
-            "quick_fallback_reason": f"completed_no_pptx hop={hop} job={job_id}",
-            "quick_job": job_id,
-            "hop": hop,
-            "rev": "c1-quick-wait-scp",
-        }
+
+    with tempfile.TemporaryDirectory(prefix="oc-patha-") as td:
+        prompt_path = os.path.join(td, "PROMPT.md")
+        with open(prompt_path, "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+        try:
+            _opencode_scp_to([prompt_path], remote_job, timeout=60)
+            if not _ct_dir and _ubion_logo_paths():  # SHIRAKI-STYLES: Ubion logo for every non-template theme
+                _opencode_scp_to(_ubion_logo_paths(), remote_job + "/assets", timeout=60)
+            if _ct_dir:
+                _ct_r = subprocess.run(
+                    ["scp", "-q", "-r", "-i", os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519",
+                     "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", _ct_dir,
+                     f"{os.environ.get('DAOU_OPENCODE_HOST') or os.environ.get('DAOU_FALLBACK_HOST') or 'root@185.215.180.212'}:{remote_job}/template"],
+                    capture_output=True, text=True, timeout=120)
+                if _ct_r.returncode != 0:
+                    logger.warning("daou-workspace: company template upload failed: %s", _ct_r.stderr[-300:])
+                    raise RuntimeError("template_upload")
+                _opencode_ssh(f"test -s {shlex.quote(remote_job + '/template/SKILL.md')}", timeout=30)
+        except Exception as e:
+            logger.warning("daou-workspace: opencode scp prompt failed: %s", e)
+            return {
+                "engine": "opencode",
+                "opencode_fallback": True,
+                "opencode_fallback_reason": f"scp_prompt:{e}",
+                "rev": SESSION_REV,
+            }
+
+    # Run OpenCode unattended via a scp'd runner script (no python -c quoting).
+    runner_src = """#!/usr/bin/env python3
+import os, subprocess, pathlib, shutil, sys
+WAIT = __WAIT__
+PROMPT = pathlib.Path(__PROMPT__)
+LOG = pathlib.Path(__LOG__)
+OUT = pathlib.Path(__OUT__)
+WORK = pathlib.Path(__WORK__)
+OUT_DIR = pathlib.Path(__OUT_DIR__)
+OC = __OC__
+
+def main() -> int:
+    oc = OC
+    if not (os.path.isfile(oc) and os.access(oc, os.X_OK)):
+        oc = shutil.which("opencode") or OC
+    prompt = PROMPT.read_text(encoding="utf-8")
+    env = os.environ.copy()
+    env["SKIP_DESIGN_GATE"] = "1"
+    ds = pathlib.Path("/root/.config/opencode/deepseek.env")
+    if ds.is_file():
+        for line in ds.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            k, _, v = line.partition("=")
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    with LOG.open("w", encoding="utf-8") as log:
+        try:
+            r = subprocess.run(
+                [oc, "run", "--auto", "-m", "deepseek/deepseek-flash", prompt],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=WAIT,
+                env=env,
+                cwd=str(WORK),
+            )
+            code = r.returncode
+        except subprocess.TimeoutExpired:
+            log.write("TIMEOUT" + chr(10))
+            code = 124
+    if not OUT.is_file():
+        cands = list(WORK.rglob("*.pptx")) + list(OUT_DIR.rglob("*.pptx"))
+        if cands:
+            shutil.copy2(cands[0], OUT)
+    if not OUT.is_file():
+        print("NO_PPTX", file=sys.stderr)
+        (OUT_DIR.parent / "EXIT").write_text(str(code or 2))
+        return code or 2
+    (OUT_DIR.parent / "EXIT").write_text("0")
+    # SESSION_REV=2026-10-29-fix-last-deck: deck written but opencode lingered -> still success
+    print(OUT, OUT.stat().st_size, "TIMEOUT_BUT_PPTX" if code == 124 else "")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+    runner_src = (
+        runner_src
+        .replace("__WAIT__", str(int(wait)))
+        .replace("__PROMPT__", repr(remote_job + "/PROMPT.md"))
+        .replace("__LOG__", repr(remote_job + "/opencode.log"))
+        .replace("__OUT__", repr(remote_pptx))
+        .replace("__WORK__", repr(remote_work))
+        .replace("__OUT_DIR__", repr(remote_out))
+        .replace("__OC__", repr(oc_bin))
+    )
+    with tempfile.TemporaryDirectory(prefix="oc-runner-") as td2:
+        runner_path = os.path.join(td2, "run_opencode_job.py")
+        with open(runner_path, "w", encoding="utf-8") as fh:
+            fh.write(runner_src)
+        try:
+            _opencode_scp_to([runner_path], remote_job, timeout=60)
+        except Exception as e:
+            logger.warning("daou-workspace: opencode scp runner failed: %s", e)
+            return {
+                "engine": "opencode",
+                "opencode_fallback": True,
+                "opencode_fallback_reason": f"scp_runner:{e}",
+                "opencode_job": job,
+                "hop": "opencode",
+                "rev": SESSION_REV,
+            }
+    # TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): detached runner (setsid nohup) + short polls. An ssh drop no longer kills the
+    # job; a gateway restart leaves a pending record that _gate_recover_loop delivers later.
+    remote_cmd = (
+        f"chmod +x {shlex.quote(remote_job + '/run_opencode_job.py')} && "
+        f"cd {shlex.quote(remote_job)} && (setsid nohup python3 run_opencode_job.py > runner.out 2>&1 < /dev/null &) && echo started"
+    )
+    _g = _gate()
+    _room = os.path.basename(os.path.dirname(path))
+    if _g:
+        try:
+            _g.pending_add({"job": job, "remote_job": remote_job, "remote_pptx": remote_pptx, "path": path,
+                            "room": _room, "theme": theme_v if _ct_dir else None, "theme_raw": theme_v})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("daou-workspace: pending record failed: %s", e)
     try:
+        _opencode_ssh(remote_cmd, timeout=60)
+    except Exception as e:
+        logger.warning("daou-workspace: opencode launch failed: %s", e)
+        if _g:
+            _g.pending_done(job, "launch_failed")
+        return {
+            "engine": "opencode", "opencode_fallback": True, "opencode_fallback_reason": f"launch:{str(e)[:300]}",
+            "opencode_job": job, "hop": "opencode", "rev": SESSION_REV, "company_template": _ct_dir and theme_v,
+        }
+    _deadline = t0 + wait + 90
+    _ssh_err_since = None
+    _state = ""
+    while _time.time() < _deadline:
+        _time.sleep(10)
+        try:
+            _state = _opencode_ssh(
+                f"cat {shlex.quote(remote_job + '/EXIT')} 2>/dev/null; echo; test -s {shlex.quote(remote_pptx)} && echo DECK || true",
+                timeout=40,
+            ).strip()
+            _ssh_err_since = None
+        except Exception as e:  # transient ssh drop: keep polling, the hop job keeps running
+            _ssh_err_since = _ssh_err_since or _time.time()
+            logger.warning("daou-workspace: opencode poll ssh error (job=%s): %s", job, str(e)[:160])
+            if _time.time() - _ssh_err_since > 300:
+                break
+            continue
+        if _state.splitlines() and _state.splitlines()[0].strip().isdigit():
+            break
+    if "DECK" not in _state:
+        logger.warning("daou-workspace: opencode run no deck job=%s state=%r", job, _state[-80:])
+        if _g:
+            try:  # job may still finish: let the recovery loop deliver it (marked orphan)
+                _rec = _g._load(_g.PENDING_DIR / f"{job}.json", None)
+                if _rec is not None:
+                    _rec["orphan"] = True
+                    _g._save(_g.PENDING_DIR / f"{job}.json", _rec)
+            except Exception:
+                pass
+        return {
+            "engine": "opencode",
+            "opencode_fallback": True,
+            "opencode_fallback_reason": f"run:no_deck state={_state[-60:]!r}",
+            "opencode_job": job,
+            "hop": "opencode",
+            "elapsed_s": round(_time.time() - t0, 1),
+            "rev": SESSION_REV,
+            "company_template": _ct_dir and theme_v,
+        }
+    logger.info("daou-workspace: opencode hop done job=%s state=%s", job, _state[-60:])
+
+    # Fetch pptx
+    local_tmp = path + ".opencode-tmp.pptx"
+    try:
+        _opencode_scp_from(remote_pptx, local_tmp, timeout=120)
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
-        shutil.copy2(pptx_src, path)
+        shutil.move(local_tmp, path)
         os.chmod(path, 0o644)
-    except OSError as e:
-        logger.warning("daou-workspace: quick sidecar copy failed: %s", e)
-        return None
+    except Exception as e:
+        try:
+            if os.path.isfile(local_tmp):
+                os.unlink(local_tmp)
+        except OSError:
+            pass
+        logger.warning("daou-workspace: opencode fetch pptx failed: %s", e)
+        return {
+            "engine": "opencode",
+            "opencode_fallback": True,
+            "opencode_fallback_reason": f"fetch:{str(e)[:300]}",
+            "opencode_job": job,
+            "hop": "opencode",
+            "elapsed_s": round(_time.time() - t0, 1),
+            "rev": SESSION_REV,
+        }
+
+    if not _ct_dir:  # SHIRAKI-STYLES: theme major/minor latin+ea = S-Core Dream (run fonts already are)
+        _pptx_force_theme_fonts(path)
+    if _g:
+        _g.pending_done(job, "delivered_in_turn")
+        _g.stamp_office_keywords(path, {"ubm-engine": "opencode-patha", "ubm-template": theme_v if _ct_dir else ""})
     if not os.path.isfile(path) or os.path.getsize(path) < 64:
-        return None
+        return {
+            "engine": "opencode",
+            "opencode_fallback": True,
+            "opencode_fallback_reason": "empty_pptx",
+            "opencode_job": job,
+            "hop": "opencode",
+            "rev": SESSION_REV,
+        }
+
     return {
         "theme_wired": theme_v,
         "style_wired": style_v,
+        "shiraki": _pmeta.get("shiraki"),
+        "palette_wired": _pmeta.get("palette"),
+        "ubion_logo": bool(_pmeta.get("ubion_logo") or _ct_dir),
         "layout_wired": layout_v or None,
-        "style_recipe": (recipe or {}).get("structure_3"),
-        "engine": "quick",
-        "quick_job": job_id,
-        "hop": hop,
-        "source": pptx_src,
+        "engine": "opencode",
+        "path_a": True,
+        "opencode_job": job,
+        "hop": "opencode",
+        "source": remote_pptx,
         "fixed": 0,
         "truncated": 0,
         "still_overflow": 0,
@@ -1287,7 +1985,9 @@ def _quick_sidecar(
         "checked": 0,
         "rev": SESSION_REV,
         "elapsed_s": round(_time.time() - t0, 1),
-        "mac_summary": (res.get("mac_summary") or "")[:500],
+        "export": "export_deck_pptx.mjs/html2pptx+pptxgenjs",
+        "company_template": theme_v if _ct_dir else None,
+        "layout_ignored": _pmeta.get("layout_ignored"),
     }
 
 
@@ -1537,11 +2237,13 @@ def pre_gateway_dispatch(event=None, **_kw):
                 parts.append(f"{k}={kv[k]}")
         arglist = ", ".join(["format=pptx"] + parts)
         note = (
-            f"\n\n{_HARD_THEME_TAG} {' '.join(parts)} — MUST call daou_make_document("
+            f"\n\n{_HARD_THEME_TAG} {' '.join(parts)} — 연구(wiki/web) 후 daou_make_document("
             f"{arglist}) and regenerate a NEW pptx now. "
             "Do NOT reuse or point at an existing pptx. "
-            "engine=quick (default) uses Mac Quick Generate sidecar; engine=legacy = LMS python-pptx. "
-            "Quick path: pass theme/style/layout/canvas through (no _PPT_STYLE_FAMILY)."
+            "Research first unless research=off or long pasted manuscript. "
+            "HARD: pages=N exactly N slides; dense blocks + Sources; no invent-from-title. "
+            "engine=opencode (default) = OpenCode huashu Path A; engine=legacy = LMS; engine=quick removed. "
+            "OpenCode path: pass theme/style/layout/canvas through (no _PPT_STYLE_FAMILY)."
         )
         return {"action": "rewrite", "text": text.rstrip() + note}
     except Exception as e:
@@ -1567,6 +2269,20 @@ def pre_llm_call(user_message="", session_id="", **_kw):
                 elif isinstance(p, dict) and isinstance(p.get("text"), str):
                     parts.append(p["text"])
             msg = "\n".join(parts)
+        _dsid = session_id or ""
+        if _dsid and not _SESSION_RE.match(_dsid):
+            _m = re.search(r"(daou_[A-Za-z0-9_-]+_[a-z0-9]+)", _dsid)
+            if _m:
+                _dsid = _m.group(1)
+        _docx_ctx = _docx_pre_llm_context(msg, _dsid)
+        if _docx_ctx:
+            return _docx_ctx
+        _xlsx_ctx = _xlsx_pre_llm_context(msg, _dsid)
+        if _xlsx_ctx:
+            return _xlsx_ctx
+        _hwpx_ctx = _hwpx_pre_llm_context(msg, _dsid)
+        if _hwpx_ctx:
+            return _hwpx_ctx
         slug = _extract_slide_theme(msg)
         style_slug = _extract_slide_style(msg)
         if not slug or not style_slug:
@@ -1625,14 +2341,18 @@ def pre_llm_call(user_message="", session_id="", **_kw):
             if kv.get(k):
                 parts.append(f"{k}={kv[k]}")
                 call_bits.append(f"{k}={kv[k]}")
-        eng = (kv.get("engine") or os.environ.get("PPT_ENGINE") or "quick").strip().lower()
+        eng = (kv.get("engine") or os.environ.get("PPT_ENGINE") or "opencode").strip().lower()
         ctx = (
             f"{_HARD_THEME_TAG} Inbound requested ppt {' '.join(parts)}. "
-            f"Call daou_make_document with {', '.join(call_bits)} "
+            f"연구(wiki/web) 후 daou_make_document with {', '.join(call_bits)} "
             "(required — never omit theme=/style=/engine= from the wire). Regenerate; do not reuse an old file. "
-            f"Default engine={eng if eng in ('quick','legacy') else 'quick'} "
-            "(quick=Mac Quick Generate sidecar; legacy=LMS python-pptx). "
-            "Messenger: `/슬라이드 theme=<brand_id> style=<style_id> pages=N [layout=] [canvas=] [engine=quick|legacy]`."
+            "Research before deck unless research=off or long pasted manuscript (~400+ chars body). "
+            "HARD density: pages=N → exactly N slides (no fewer); ≥N level-1 headings; "
+            "~120+ useful body chars/page; Sources required after research; web_extract≥2 for external topics; "
+            "never invent-from-title / slogan-only blocks. "
+            f"Default engine={eng if eng in ('opencode','legacy') else 'opencode'} "
+            "(opencode=OpenCode huashu Path A; legacy=LMS python-pptx; engine=quick removed/rejected). "
+            "Messenger: `/슬라이드 theme=<brand_or_specimen> style=<style_id> pages=N [layout=] [canvas=] [engine=opencode|legacy] [research=off]`."
         )
         return {"context": ctx}
     except Exception as e:
@@ -1640,6 +2360,414 @@ def pre_llm_call(user_message="", session_id="", **_kw):
         return None
 
 
+
+
+
+# --- UBM Word templates (SESSION_REV=2026-10-29-docx-templates) -----------------------------------
+# Messenger `/워드 template=<docx-id> <prompt>` → daou_make_document format=docx template=<id>.
+# Renderer + templates deployed at DOCX_TEMPLATE_ROOT (repo desktop/server/wizard/doc-skills/docx).
+DOCX_TEMPLATE_ROOT = os.environ.get("DAOU_DOCX_TEMPLATE_ROOT", "/opt/ubm-doc-skills/docx")
+_PENDING_DOCX_TPL_NAME = ".pending_docx_template"
+_DOCX_TPL_RE = re.compile(r"/워드\b[^\n]*?\btemplate=(docx-[a-z0-9-]+)", re.IGNORECASE)
+_DOCX_TPL_ID_RE = re.compile(r"^docx-[a-z0-9-]+$")
+
+
+def _docx_template_dir(tid) -> str | None:
+    tid = str(tid or "").strip().lower()
+    if not _DOCX_TPL_ID_RE.match(tid):
+        return None
+    d = os.path.join(DOCX_TEMPLATE_ROOT, tid)
+    return d if os.path.isfile(os.path.join(d, "template.docx")) else None
+
+
+def _extract_docx_template(text) -> str | None:
+    if not isinstance(text, str):
+        return None
+    m = _DOCX_TPL_RE.search(text)
+    return m.group(1).lower() if m and _docx_template_dir(m.group(1)) else None
+
+
+def _docx_pending_path(session_or_chat_id: str) -> str | None:
+    room = room_dir(session_or_chat_id or "")
+    return os.path.join(room, _PENDING_DOCX_TPL_NAME) if room else None
+
+
+def _stash_pending_docx_template(session_or_chat_id: str, tid: str, msg: str = "") -> None:
+    path = _docx_pending_path(session_or_chat_id)
+    if not path or not tid:
+        return
+    import hashlib
+    h = hashlib.sha1((msg or "").encode("utf-8")).hexdigest()[:16]
+    try:
+        # pre_llm_call fires on every LLM call of a turn: don't re-arm a template already used for this message
+        if Path(path + ".used").read_text(encoding="utf-8").strip() == h:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        Path(path).write_text(tid + "\n" + h + "\n", encoding="utf-8")
+        logger.info("daou-workspace: stashed pending docx template %s -> %s", tid, path)
+    except OSError as e:
+        logger.warning("daou-workspace: stash docx template failed: %s", e)
+
+
+def _read_pending_docx_template(session_or_chat_id: str, *, consume: bool = False) -> str | None:
+    path = _docx_pending_path(session_or_chat_id)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
+        tid = lines[0].strip()
+    except (OSError, IndexError):
+        return None
+    if consume:
+        try:
+            Path(path + ".used").write_text((lines[1].strip() if len(lines) > 1 else "") + "\n", encoding="utf-8")
+            os.unlink(path)
+        except OSError:
+            pass
+    return tid if _docx_template_dir(tid) else None
+
+
+def _resolve_docx_template(args: dict, session_id: str = "", *, consume: bool = False) -> str | None:
+    if not isinstance(args, dict) or str(args.get("format") or "").lower() != "docx":
+        return None
+    explicit = str(args.get("template") or "").strip().lower()
+    if explicit and not _docx_template_dir(explicit):
+        explicit = ""
+    if explicit and not consume:
+        return explicit
+    keys = []
+    if session_id:
+        keys.append(_normalize_daou_session_id(session_id))
+    path = _resolve(args.get("path"))
+    if path and _under(path, WORK_ROOT):
+        room = os.path.basename(os.path.dirname(path))
+        if room:
+            keys.append(f"daou_{room}_x")
+    for k in keys:
+        tid = _read_pending_docx_template(k, consume=consume)
+        if tid:
+            return explicit or tid
+    return explicit or None
+
+
+def _docx_skill_rules(tid: str) -> str:
+    d = _docx_template_dir(tid)
+    if not d:
+        return ""
+    try:
+        txt = Path(os.path.join(d, "SKILL.md")).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    keep = []
+    for sec in ("## 메타(meta) 필드", "## 섹션 구성", "## 작성 규칙"):
+        i = txt.find(sec)
+        if i >= 0:
+            j = txt.find("\n## ", i + 4)
+            keep.append(txt[i: j if j > 0 else len(txt)].strip())
+    return "\n".join(keep)[:2500]
+
+
+_DOCX_RENDER_MOD = None
+
+
+def _load_docx_renderer():
+    global _DOCX_RENDER_MOD
+    if _DOCX_RENDER_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ubm_render_docx", os.path.join(DOCX_TEMPLATE_ROOT, "render_docx.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _DOCX_RENDER_MOD = mod
+    return _DOCX_RENDER_MOD
+
+
+def _docx_pre_llm_context(msg: str, sid: str):
+    tid = _extract_docx_template(msg)
+    if not tid:
+        return None
+    if sid:
+        _stash_pending_docx_template(sid, tid, msg)
+    return {"context": (
+        f"[HARD daou-docx-template] Inbound requested Word template={tid}. Call daou_make_document with "
+        f"format=docx, template={tid}, title, meta (object) and blocks (heading/paragraph/bullets/table only; "
+        "text only — never formatting). The template owns all design (cover, header band, fonts, colors). "
+        "Rules from the template SKILL.md:\n" + _docx_skill_rules(tid)
+    )}
+
+# --- UBM Excel templates (SESSION_REV=2026-10-29-xlsx-templates) -----------------------------------
+# Messenger `/엑셀 template=<xlsx-id> <prompt>` → daou_make_document format=xlsx template=<id>.
+# Renderer + templates deployed at XLSX_TEMPLATE_ROOT (repo desktop/server/wizard/doc-skills/xlsx).
+XLSX_TEMPLATE_ROOT = os.environ.get("DAOU_XLSX_TEMPLATE_ROOT", "/opt/ubm-doc-skills/xlsx")
+_PENDING_XLSX_TPL_NAME = ".pending_xlsx_template"
+XLSX_SKILL_SECTIONS = ("## 메타(meta) 필드", "## 입력 필드", "## 입력 표", "## 작성 규칙")
+_XLSX_TPL_RE = re.compile(r"/엑셀\b[^\n]*?\btemplate=(xlsx-[a-z0-9-]+)", re.IGNORECASE)
+_XLSX_TPL_ID_RE = re.compile(r"^xlsx-[a-z0-9-]+$")
+
+
+def _xlsx_template_dir(tid) -> str | None:
+    tid = str(tid or "").strip().lower()
+    if not _XLSX_TPL_ID_RE.match(tid):
+        return None
+    d = os.path.join(XLSX_TEMPLATE_ROOT, tid)
+    return d if os.path.isfile(os.path.join(d, "template.xlsx")) else None
+
+
+def _extract_xlsx_template(text) -> str | None:
+    if not isinstance(text, str):
+        return None
+    m = _XLSX_TPL_RE.search(text)
+    return m.group(1).lower() if m and _xlsx_template_dir(m.group(1)) else None
+
+
+def _xlsx_pending_path(session_or_chat_id: str) -> str | None:
+    room = room_dir(session_or_chat_id or "")
+    return os.path.join(room, _PENDING_XLSX_TPL_NAME) if room else None
+
+
+def _stash_pending_xlsx_template(session_or_chat_id: str, tid: str, msg: str = "") -> None:
+    path = _xlsx_pending_path(session_or_chat_id)
+    if not path or not tid:
+        return
+    import hashlib
+    h = hashlib.sha1((msg or "").encode("utf-8")).hexdigest()[:16]
+    try:
+        # pre_llm_call fires on every LLM call of a turn: don't re-arm a template already used for this message
+        if Path(path + ".used").read_text(encoding="utf-8").strip() == h:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        Path(path).write_text(tid + "\n" + h + "\n", encoding="utf-8")
+        logger.info("daou-workspace: stashed pending xlsx template %s -> %s", tid, path)
+    except OSError as e:
+        logger.warning("daou-workspace: stash xlsx template failed: %s", e)
+
+
+def _read_pending_xlsx_template(session_or_chat_id: str, *, consume: bool = False) -> str | None:
+    path = _xlsx_pending_path(session_or_chat_id)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
+        tid = lines[0].strip()
+    except (OSError, IndexError):
+        return None
+    if consume:
+        try:
+            Path(path + ".used").write_text((lines[1].strip() if len(lines) > 1 else "") + "\n", encoding="utf-8")
+            os.unlink(path)
+        except OSError:
+            pass
+    return tid if _xlsx_template_dir(tid) else None
+
+
+def _resolve_xlsx_template(args: dict, session_id: str = "", *, consume: bool = False) -> str | None:
+    if not isinstance(args, dict) or str(args.get("format") or "").lower() != "xlsx":
+        return None
+    explicit = str(args.get("template") or "").strip().lower()
+    if explicit and not _xlsx_template_dir(explicit):
+        explicit = ""
+    if explicit and not consume:
+        return explicit
+    keys = []
+    if session_id:
+        keys.append(_normalize_daou_session_id(session_id))
+    path = _resolve(args.get("path"))
+    if path and _under(path, WORK_ROOT):
+        room = os.path.basename(os.path.dirname(path))
+        if room:
+            keys.append(f"daou_{room}_x")
+    for k in keys:
+        tid = _read_pending_xlsx_template(k, consume=consume)
+        if tid:
+            return explicit or tid
+    return explicit or None
+
+
+def _xlsx_skill_rules(tid: str) -> str:
+    d = _xlsx_template_dir(tid)
+    if not d:
+        return ""
+    try:
+        txt = Path(os.path.join(d, "SKILL.md")).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    keep = []
+    for sec in XLSX_SKILL_SECTIONS:
+        i = txt.find(sec)
+        if i >= 0:
+            j = txt.find("\n## ", i + 4)
+            keep.append(txt[i: j if j > 0 else len(txt)].strip())
+    return "\n".join(keep)[:6000]
+
+
+_XLSX_RENDER_MOD = None
+
+
+def _load_xlsx_renderer():
+    global _XLSX_RENDER_MOD
+    if _XLSX_RENDER_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ubm_render_xlsx", os.path.join(XLSX_TEMPLATE_ROOT, "render_xlsx.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _XLSX_RENDER_MOD = mod
+    return _XLSX_RENDER_MOD
+
+
+def _xlsx_pre_llm_context(msg: str, sid: str):
+    tid = _extract_xlsx_template(msg)
+    if not tid:
+        return None
+    if sid:
+        _stash_pending_xlsx_template(sid, tid, msg)
+    return {"context": (
+        f"[HARD daou-xlsx-template] Inbound requested Excel template={tid}. Call daou_make_document with "
+        f"format=xlsx, template={tid}, path=<work folder>/<name>.xlsx, title, meta (object), blocks=[] and "
+        "data={\"fields\": {...}, \"tables\": {...}} filling ONLY the template's input fields/table columns listed below "
+        "(plain values: numbers without units, dates YYYY-MM-DD, dropdown values exactly as allowed). Never send formulas "
+        "(no leading '='), formatting, or computed columns (합계/잔액/집행률/금액/한도/초과액 etc. are calculated by the template). "
+        "If the tool returns an error, fix the data and call again once. Rules from the template SKILL.md:\n" + _xlsx_skill_rules(tid)
+    )}
+
+
+# --- UBM 한글 templates (SESSION_REV=2026-10-29-hwpx-templates) -----------------------------------
+# Messenger `/한글 template=<hwpx-id> <prompt>` → daou_make_document format=hwpx template=<id>.
+# Renderer + templates deployed at HWPX_TEMPLATE_ROOT (repo desktop/server/wizard/doc-skills/hwpx).
+HWPX_TEMPLATE_ROOT = os.environ.get("DAOU_HWPX_TEMPLATE_ROOT", "/opt/ubm-doc-skills/hwpx")
+_PENDING_HWPX_TPL_NAME = ".pending_hwpx_template"
+_HWPX_TPL_RE = re.compile(r"/한글\b[^\n]*?\btemplate=(hwpx-[a-z0-9-]+)", re.IGNORECASE)
+_HWPX_TPL_ID_RE = re.compile(r"^hwpx-[a-z0-9-]+$")
+
+
+def _hwpx_template_dir(tid) -> str | None:
+    tid = str(tid or "").strip().lower()
+    if not _HWPX_TPL_ID_RE.match(tid):
+        return None
+    d = os.path.join(HWPX_TEMPLATE_ROOT, tid)
+    return d if os.path.isfile(os.path.join(d, "template.hwpx")) else None
+
+
+def _extract_hwpx_template(text) -> str | None:
+    if not isinstance(text, str):
+        return None
+    m = _HWPX_TPL_RE.search(text)
+    return m.group(1).lower() if m and _hwpx_template_dir(m.group(1)) else None
+
+
+def _hwpx_pending_path(session_or_chat_id: str) -> str | None:
+    room = room_dir(session_or_chat_id or "")
+    return os.path.join(room, _PENDING_HWPX_TPL_NAME) if room else None
+
+
+def _stash_pending_hwpx_template(session_or_chat_id: str, tid: str, msg: str = "") -> None:
+    path = _hwpx_pending_path(session_or_chat_id)
+    if not path or not tid:
+        return
+    import hashlib
+    h = hashlib.sha1((msg or "").encode("utf-8")).hexdigest()[:16]
+    try:
+        # pre_llm_call fires on every LLM call of a turn: don't re-arm a template already used for this message
+        if Path(path + ".used").read_text(encoding="utf-8").strip() == h:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        Path(path).write_text(tid + "\n" + h + "\n", encoding="utf-8")
+        logger.info("daou-workspace: stashed pending hwpx template %s -> %s", tid, path)
+    except OSError as e:
+        logger.warning("daou-workspace: stash hwpx template failed: %s", e)
+
+
+def _read_pending_hwpx_template(session_or_chat_id: str, *, consume: bool = False) -> str | None:
+    path = _hwpx_pending_path(session_or_chat_id)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
+        tid = lines[0].strip()
+    except (OSError, IndexError):
+        return None
+    if consume:
+        try:
+            Path(path + ".used").write_text((lines[1].strip() if len(lines) > 1 else "") + "\n", encoding="utf-8")
+            os.unlink(path)
+        except OSError:
+            pass
+    return tid if _hwpx_template_dir(tid) else None
+
+
+def _resolve_hwpx_template(args: dict, session_id: str = "", *, consume: bool = False) -> str | None:
+    if not isinstance(args, dict) or str(args.get("format") or "").lower() != "hwpx":
+        return None
+    explicit = str(args.get("template") or "").strip().lower()
+    if explicit and not _hwpx_template_dir(explicit):
+        explicit = ""
+    if explicit and not consume:
+        return explicit
+    keys = []
+    if session_id:
+        keys.append(_normalize_daou_session_id(session_id))
+    path = _resolve(args.get("path"))
+    if path and _under(path, WORK_ROOT):
+        room = os.path.basename(os.path.dirname(path))
+        if room:
+            keys.append(f"daou_{room}_x")
+    for k in keys:
+        tid = _read_pending_hwpx_template(k, consume=consume)
+        if tid:
+            return explicit or tid
+    return explicit or None
+
+
+def _hwpx_skill_rules(tid: str) -> str:
+    d = _hwpx_template_dir(tid)
+    if not d:
+        return ""
+    try:
+        txt = Path(os.path.join(d, "SKILL.md")).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    keep = []
+    for sec in ("## 메타(meta) 필드", "## 섹션 구성", "## 작성 규칙"):
+        i = txt.find(sec)
+        if i >= 0:
+            j = txt.find("\n## ", i + 4)
+            keep.append(txt[i: j if j > 0 else len(txt)].strip())
+    return "\n".join(keep)[:2500]
+
+
+_HWPX_RENDER_MOD = None
+
+
+def _load_hwpx_renderer():
+    global _HWPX_RENDER_MOD
+    if _HWPX_RENDER_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ubm_render_hwpx", os.path.join(HWPX_TEMPLATE_ROOT, "render_hwpx.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HWPX_RENDER_MOD = mod
+    return _HWPX_RENDER_MOD
+
+
+def _hwpx_pre_llm_context(msg: str, sid: str):
+    tid = _extract_hwpx_template(msg)
+    if not tid:
+        return None
+    if sid:
+        _stash_pending_hwpx_template(sid, tid, msg)
+    return {"context": (
+        f"[HARD daou-hwpx-template] Inbound requested 한글 template={tid}. Call daou_make_document with "
+        f"format=hwpx, template={tid}, title, meta (object) and blocks (heading/paragraph/bullets/table only; "
+        "text only — never formatting). The template owns all design (cover, styles, fonts, colors, table fills). "
+        "Rules from the template SKILL.md:\n" + _hwpx_skill_rules(tid)
+    )}
 
 
 # --- daou_make_document ---------------------------------------------------------------------------
@@ -1674,10 +2802,10 @@ _BLOCK_SCHEMA = {
 SCHEMA = {
     "name": "daou_make_document",
     "description": (
-        "[SESSION_REV=2026-10-24-doc-summary-v2] Create a Word (.docx), 한글 (.hwpx), PDF or PowerPoint (.pptx) document from structured blocks and save "
-        "it in the room's work folder. [SESSION_REV=2026-10-26-ab-parity-fixes-l3] pptx default engine=quick PPT_QUICK_WAIT=420 (Mac Quick Generate via daou_mac_content hop; fail→legacy _write_pptx). engine=legacy forces LMS python-pptx. Messenger `/슬라이드 theme= style= pages= [layout=] [canvas=] [engine=quick|legacy]`. Quick path: style→SVG layout recipe + cover-logo when brand has images/logo.png; Huashu 01–20 specimen theme forces engine=legacy (SESSION_REV=2026-10-26-ab-parity-fixes). brand_id (中国电信/ubion/…) stays Quick. Word←claude-office; Hangul←hwpx-skill; PPT Quick←Mac/185, legacy←huashu. For pptx: each level-1 heading starts a slide; optional heading.layout = title|section|content|two_column|cards|kpi|tiles (auto if omitted); bullets.columns=2 for two-column lists; tables get styled headers. Use this for "
+        "[SESSION_REV=2026-10-24-doc-summary-v2] Create a Word (.docx), 한글 (.hwpx), PDF, PowerPoint (.pptx) or Excel template (.xlsx, template required) document from structured blocks and save "
+        "it in the room's work folder. [SESSION_REV=2026-10-29-remove-quick] pptx default engine=opencode (OpenCode deepseek-flash + huashu Path A HTML→export_deck_pptx; PPT_OPENCODE_WAIT=1020). engine=legacy = LMS python-pptx. engine=quick REMOVED (reject). Messenger `/슬라이드 theme= style= pages= [layout=] [canvas=] [engine=opencode|legacy]`. theme/style = specimen/brand visual direction for OpenCode. OpenCode fail → legacy only. Word←claude-office; Hangul←hwpx-skill. For pptx: each level-1 heading starts a slide; optional heading.layout = title|section|content|two_column|cards|kpi|tiles (auto if omitted); bullets.columns=2 for two-column lists; tables get styled headers. Use this for "
         "양식/문서/보고서/회의록/발표자료 requests — there is no shell or code execution. `path` must be an absolute path inside the work folder given in the system prompt, "
-        "with the extension matching `format`. Always include tool name 'daou_make_document' in the call. 「한 장」/1페이지/one page/한장 → pages=1 (필수; compact layout + content budget). If blocks are huge (many slides/tables), split into multiple files. Reply with the saved path so the file can be delivered."
+        "with the extension matching `format`. Always include tool name 'daou_make_document' in the call. 「한 장」/1페이지/one page/한장 → pages=1 (필수; compact layout + content budget). pptx HARD density (SESSION_REV=2026-10-26-slide-research-dense): pages=N requires exactly N level-1 headings, ~120+ useful body chars per page, Sources after research; thin/title-only blocks soft-reject with error JSON — enrich and retry, never invent from title. If blocks are huge (many slides/tables), split into multiple files. Reply with the saved path so the file can be delivered."
     ),
     "parameters": {
         "type": "object",
@@ -1686,6 +2814,10 @@ SCHEMA = {
             "path": {"type": "string", "description": "Absolute output path, e.g. <work folder>/회의록.hwpx"},
             "title": {"type": "string", "description": "Document title (first heading)"},
             "blocks": {"type": "array", "items": _BLOCK_SCHEMA},
+            "data": {
+                "type": "object",
+                "description": "XLSX template only: {fields: {<sheet>: {<key>: value}}, tables: {<table>: [{<col>: value}]}} — input cells only; formulas/formatting/calc columns are rejected.",
+            },
             "pages": {
                 "type": "integer",
                 "description": (
@@ -1693,6 +2825,25 @@ SCHEMA = {
                     "Enforces compact layout + hard content budget for docx: "
                     "title + 1-2 line intro + ONE compact table + <=3 bullets (or tiny source line). "
                     "Do NOT dump 4-5 full sections. LibreOffice page QC retries with tighter trim."
+                ),
+            },
+            "template": {
+                "type": "string",
+                "description": (
+                    "DOCX only (SESSION_REV=2026-10-29-docx-templates). UBM Word template id from the wizard: "
+                    "docx-proposal-blue|docx-proposal-gray|docx-report-blue|docx-report-gray|docx-gongmun-blue|docx-gongmun-gray. "
+                    "Messenger `/워드 template=<id> <요청>`. The template owns all design; send text-only blocks + meta."
+                    " XLSX (SESSION_REV=2026-10-29-xlsx-templates): xlsx-budget|xlsx-sales|xlsx-travel via `/엑셀 template=<id> <요청>` "
+                    "(format=xlsx, blocks=[], data={fields,tables} input cells only)."
+                    " HWPX (SESSION_REV=2026-10-29-hwpx-templates): hwpx-proposal-blue|hwpx-proposal-gray|hwpx-report-blue|"
+                    "hwpx-report-gray|hwpx-gongmun-blue|hwpx-gongmun-gray via `/한글 template=<id> <요청>` (format=hwpx)."
+                ),
+            },
+            "meta": {
+                "type": "object",
+                "description": (
+                    "DOCX/HWPX template only: cover/letter fields (strings), e.g. subtitle, client, org, date, author, doc_no, abstract; "
+                    "공문: recipient, via, sender, drafter, reviewer, approver, doc_no, date, tel, email, attachments (array)."
                 ),
             },
             "compact": {
@@ -1715,27 +2866,33 @@ SCHEMA = {
                 "description": (
                     "PPTX only. style=<ppt-master style_id>. "
                     "engine=legacy: maps to layout family via _PPT_STYLE_FAMILY. "
-                    "engine=quick (default): pass-through to Quick brief (no family mapping). "
+                    "engine=opencode (default): visual direction for OpenCode/huashu. "
                     "Picker ids: workshop-teaching, mbb-consulting, solution-proposal, "
                     "academic-research, operating-review, narrative-keynote. "
+                    "Also shiraki-NNN (shiraki.design No.001–236 design-spec YAML, e.g. shiraki-003). "
                     "Orthogonal to theme= (palette)."
                 ),
             },
+            "palette": {
+                "type": "string",
+                "description": "PPTX + style=shiraki-NNN only. omit = original YAML colors; palette=brand = theme brand palette (Ubion navy/teal) with YAML layout kept.",
+            },
             "layout": {
                 "type": "string",
-                "description": "PPTX Quick path: layout template id (ppt-master layout root). Ignored by legacy except heading.layout.",
+                "description": "PPTX OpenCode/legacy optional layout template id. Ignored by legacy except heading.layout.",
             },
             "canvas": {
                 "type": "string",
-                "description": "PPTX Quick path: canvas/format token (e.g. 16x9, 16:9, 4x3). Legacy always 16:9.",
+                "description": "PPTX canvas/format token (e.g. 16x9, 16:9, 4x3, ppt169). Legacy always 16:9.",
             },
             "engine": {
                 "type": "string",
-                "enum": ["quick", "legacy"],
+                "enum": ["opencode", "legacy"],
                 "description": (
-                    "PPTX only. quick (default, env PPT_ENGINE): Mac/185 Quick Generate sidecar via "
-                    "daou_mac_content hop; on failure/timeout falls back to legacy. "
-                    "legacy: LMS _write_pptx (python-pptx + Huashu family)."
+                    "PPTX only. opencode (default, env PPT_ENGINE): OpenCode deepseek-flash + huashu "
+                    "Path A (HTML→export_deck_pptx/html2pptx) via content hop. "
+                    "legacy: LMS _write_pptx (python-pptx). "
+                    "engine=quick removed (2026-10-29) — rejected with clear error."
                 ),
             },
         },
@@ -2759,7 +3916,7 @@ def _write_pptx(path: str, title: str, blocks: list, *, theme: str | None = None
     SLIDE_BG = _rgb(pal["bg"])
     CHROME = pal.get("chrome", "side_bar")
     MODE = pal.get("mode", "corporate")
-    FONT = "Malgun Gothic"
+    FONT = "S-Core Dream"  # fix-last-deck (was Malgun Gothic)
     FOOTER_LABEL = str(pal.get("footer") or "유비온  ·  사내 안내")
 
     SW, SH = Inches(13.333), Inches(7.5)
@@ -3315,7 +4472,7 @@ def _write_pptx(path: str, title: str, blocks: list, *, theme: str | None = None
     # title/section/content renderers: typography, margins, chrome and grid all differ.
     FAMILY = pal.get("family") or _HUASHU_MODE_FAMILY.get(MODE, "corporate")
     F_SERIF = "NanumMyeongjo"
-    F_SANS = "Noto Sans CJK KR"
+    F_SANS = "S-Core Dream"  # fix-last-deck (was Noto Sans CJK KR)
     F_MONO = "Liberation Mono"
     F_POP = "NanumSquare"
     INK = _rgb("111111")
@@ -4583,6 +5740,50 @@ def _write_pptx(path: str, title: str, blocks: list, *, theme: str | None = None
 _WRITERS = {"docx": _write_docx, "hwpx": _write_hwpx, "pdf": _write_pdf, "pptx": _write_pptx}
 
 
+def _make_xlsx_document(params: dict, path: str) -> str:
+    # SESSION_REV=2026-10-29-xlsx-templates: business-form templates; AI fills input cells only.
+    tid = _resolve_xlsx_template(params, "", consume=True)
+    if not tid:
+        return json.dumps({"success": False, "error": "xlsx는 템플릿이 필요합니다: template=xlsx-budget|xlsx-sales|xlsx-travel (메신저 `/엑셀 template=<id>`)."}, ensure_ascii=False)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        _rx = _load_xlsx_renderer()
+        _fn = getattr(_rx, "render_report", None) or _rx.render
+        info = _fn(_xlsx_template_dir(tid), _rx.from_daou_params(params), path)
+        size = os.path.getsize(path)
+        if size > MAX_DOC_BYTES:
+            os.unlink(path)
+            return json.dumps({"success": False, "error": "document too large"})
+        os.chmod(path, 0o644)
+    except Exception as e:  # renderer rejections are retryable by the model
+        logger.warning("daou-workspace: xlsx template %s failed: %s", tid, e)
+        try:  # keep the template armed so a corrected retry still uses it
+            room = os.path.basename(os.path.dirname(path))
+            if room:
+                _stash_pending_xlsx_template(f"daou_{room}_x", tid, "retry:" + str(e)[:40])
+        except Exception:
+            pass
+        return json.dumps({"success": False, "template": tid, "template_engine": "ubm-render-xlsx",
+                           "error": f"xlsx 템플릿 채우기 실패: {str(e)[:600]}",
+                           "hint": "입력 셀/표 컬럼만, 값만(수식·서식·계산열 금지) 고쳐서 한 번 다시 호출"}, ensure_ascii=False)
+    logger.info("daou-workspace: xlsx rendered with template=%s -> %s", tid, path)
+    result = {"success": True, "path": path, "bytes": size, "template": tid, "template_engine": "ubm-render-xlsx"}
+    try:  # TEMPLATE-GATE runtime monitor
+        _g2 = _gate()
+        if _g2:
+            _rc = _g2.runtime_check(path, tid)
+            result["template_check"] = "pass" if _rc.get("ok") else "fail"
+            if not _rc.get("ok"):
+                result["notice"] = f"⚠️ 템플릿 미적용 가능성: 생성 파일이 템플릿({tid}) 검사를 통과하지 못했습니다."
+    except Exception:
+        pass
+    if isinstance(info, dict):
+        for k in ("totals", "version"):
+            if info.get(k) is not None:
+                result[k] = info[k]
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
 def make_document(params: dict, **_kw) -> str:
     fmt = params.get("format")
     path = _resolve(params.get("path"))
@@ -4595,13 +5796,41 @@ def make_document(params: dict, **_kw) -> str:
         return json.dumps({"success": False, "error": f"path must be absolute and inside {WORK_ROOT}/<room>/"})
     if not path.lower().endswith("." + fmt):
         return json.dumps({"success": False, "error": f"path must end with .{fmt}"})
+    if fmt == "xlsx":
+        return _make_xlsx_document(params, path)
     page_count = None
     overflow_report = None
     page_qc = "content_budget" if (compact and fmt == "docx") else "none"
+    docx_tpl = None
+    docx_tpl_err = None
+    hwpx_tpl = None
+    hwpx_tpl_err = None
     try:
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
         use_blocks = _budget_blocks_one_page(blocks) if compact and fmt == "docx" else blocks
-        if fmt == "docx":
+        docx_tpl = _resolve_docx_template(params, "", consume=True) if fmt == "docx" else None
+        hwpx_tpl = _resolve_hwpx_template(params, "", consume=True) if fmt == "hwpx" else None
+        if docx_tpl:
+            try:
+                _rd = _load_docx_renderer()
+                _rd.render(_docx_template_dir(docx_tpl), _rd.from_daou_params(params), path)
+                logger.info("daou-workspace: docx rendered with template=%s -> %s", docx_tpl, path)
+            except Exception as e:  # fall back to the legacy writer, report it
+                docx_tpl_err = str(e)[:300]
+                logger.warning("daou-workspace: docx template %s failed (%s); legacy writer", docx_tpl, docx_tpl_err)
+                docx_tpl = None
+                _write_docx(path, str(params.get("title") or ""), use_blocks, compact=compact)
+        elif hwpx_tpl:
+            try:
+                _rh = _load_hwpx_renderer()
+                _rh.render(_hwpx_template_dir(hwpx_tpl), _rh.from_daou_params(params), path)
+                logger.info("daou-workspace: hwpx rendered with template=%s -> %s", hwpx_tpl, path)
+            except Exception as e:  # fall back to the legacy writer, report it
+                hwpx_tpl_err = str(e)[:300]
+                logger.warning("daou-workspace: hwpx template %s failed (%s); legacy writer", hwpx_tpl, hwpx_tpl_err)
+                hwpx_tpl = None
+                _write_hwpx(path, str(params.get("title") or ""), blocks)
+        elif fmt == "docx":
             _write_docx(path, str(params.get("title") or ""), use_blocks, compact=compact)
             if compact:
                 page_count = _count_docx_pages(path)
@@ -4643,42 +5872,110 @@ def make_document(params: dict, **_kw) -> str:
                     _read_pending_theme(room_key, consume=True)
                 if forced_style:
                     _read_pending_style(room_key, consume=True)
+                # SESSION_REV=2026-10-29-research-off-gate: snapshot kv before consume
+                try:
+                    _kv_snapshot = _read_pending_slide_kv(room_key, consume=False) or {}
+                except Exception:
+                    _kv_snapshot = {}
                 _read_pending_slide_kv(room_key, consume=True)
                 ppt_blocks = use_blocks if compact else blocks
+                # SESSION_REV=2026-10-26-slide-research-dense: soft-reject thin blocks (retryable)
+                pages_for_gate = pages
+                if pages_for_gate is None:
+                    try:
+                        pages_for_gate = int(params["pages"]) if params.get("pages") is not None else None
+                    except (TypeError, ValueError):
+                        pages_for_gate = None
+                _off_vals = ("off", "0", "false", "no")
+                research_off = (
+                    str(params.get("research") or "").strip().lower() in _off_vals
+                    or str((_kv_snapshot or {}).get("research") or "").strip().lower() in _off_vals
+                )
+                thin = _soft_reject_thin_pptx(ppt_blocks, pages_for_gate, research_off=research_off)
+                if thin:
+                    # SESSION_REV=2026-10-30-density-loop: identical thin blocks repeated -> terminal stop (was a 36-iteration loop)
+                    try:
+                        import hashlib as _hl
+                        _sig = _hl.sha1(json.dumps(ppt_blocks, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+                        _prev = _THIN_REPEAT.get(path)
+                        _n = (_prev[1] + 1) if (_prev and _prev[0] == _sig) else 1
+                        _THIN_REPEAT[path] = (_sig, _n)
+                        if _n >= 2:
+                            thin["code"] = "thin_blocks_repeat"
+                            thin["repeat"] = _n
+                            thin["error"] = f"STOP: identical blocks rejected {_n} times. " + thin["error"] + (
+                                " Do NOT call any tool again this turn: tell the user in one line that generation failed and ask them to resend the same /슬라이드 command."
+                                if _n >= 3 else "")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.info(
+                        "daou-workspace: soft-reject thin pptx blocks pages=%s stats=%s",
+                        pages_for_gate,
+                        {k: thin.get(k) for k in ("headings_l1", "body_chars", "has_sources", "code")},
+                    )
+                    return json.dumps(thin, ensure_ascii=False)
                 engine = _effective_ppt_engine(params, "")
+                if engine in ("quick", "rejected_quick"):
+                    logger.info("daou-workspace: early reject engine=quick (removed)")
+                    return json.dumps(
+                        {
+                            "error": "engine_quick_removed",
+                            "message": (
+                                "engine=quick은 제거되었습니다. "
+                                "engine를 생략하면 기본 OpenCode 화슈(Path A)로 만들거나, "
+                                "간이 엔진이 필요하면 engine=legacy를 쓰세요."
+                            ),
+                            "engine": None,
+                            "hint": "omit engine or engine=opencode | engine=legacy",
+                            "rev": SESSION_REV,
+                        },
+                        ensure_ascii=False,
+                    )
+                _sty_raw = params.get("style")
+                if _shiraki_slug(params.get("theme") or "") and not _shiraki_slug(_normalize_style_slug(_sty_raw) or ""):
+                    _sty_raw = params.get("theme")  # SHIRAKI-THEME-ALIAS
+                if _shiraki_slug(_normalize_style_slug(_sty_raw) or _sty_raw or "") and not _shiraki_spec(_normalize_style_slug(_sty_raw)):
+                    return json.dumps(
+                        {
+                            "error": "unknown_shiraki_style",
+                            "message": f"알 수 없는 shiraki 스타일입니다: style={_sty_raw}. {_shiraki_range_msg()}",
+                            "rev": SESSION_REV,
+                        },
+                        ensure_ascii=False,
+                    )
                 overflow_report = None
-                if engine == "quick":
-                    # Hook A: Quick sidecar (Mac primary → 185 failover). Fail → legacy.
-                    # Note: Huashu specimen themes already forced to legacy via _effective_ppt_engine.
-                    pages_arg = pages
-                    if pages_arg is None:
-                        try:
-                            pages_arg = int(params["pages"]) if params.get("pages") is not None else None
-                        except (TypeError, ValueError):
-                            pages_arg = None
-                    overflow_report = _quick_sidecar(
+                pages_arg = pages
+                if pages_arg is None:
+                    try:
+                        pages_arg = int(params["pages"]) if params.get("pages") is not None else None
+                    except (TypeError, ValueError):
+                        pages_arg = None
+                if engine == "opencode":
+                    # Path A: OpenCode deepseek-flash + huashu HTML → export_deck_pptx (hop).
+                    # Fail → legacy _write_pptx (NOT Quick). engine=quick removed/rejected.
+                    overflow_report = _opencode_sidecar(
                         path,
                         str(params.get("title") or ""),
                         ppt_blocks,
                         theme=params.get("theme"),
-                        style=params.get("style"),  # pass-through; no _PPT_STYLE_FAMILY
+                        style=params.get("style"),
                         layout=params.get("layout"),
                         canvas=params.get("canvas"),
                         pages=pages_arg,
                         deck=params.get("deck"),
                         session_id="",
+                        research_off=research_off,
+                        palette=params.get("palette"),
                     )
                     _fb_reason = None
                     _fb_job = None
-                    _fb_hop = None
-                    if isinstance(overflow_report, dict) and overflow_report.get("quick_fallback"):
-                        _fb_reason = overflow_report.get("quick_fallback_reason")
-                        _fb_job = overflow_report.get("quick_job")
-                        _fb_hop = overflow_report.get("hop")
+                    if isinstance(overflow_report, dict) and overflow_report.get("opencode_fallback"):
+                        _fb_reason = overflow_report.get("opencode_fallback_reason")
+                        _fb_job = overflow_report.get("opencode_job")
                         overflow_report = None
                     if overflow_report is None:
                         logger.info(
-                            "daou-workspace: quick sidecar miss → legacy _write_pptx (%s)",
+                            "daou-workspace: opencode Path A miss → legacy _write_pptx (%s)",
                             _fb_reason or "None",
                         )
                         overflow_report = _write_pptx(
@@ -4690,14 +5987,37 @@ def make_document(params: dict, **_kw) -> str:
                         )
                         if isinstance(overflow_report, dict):
                             overflow_report["engine"] = "legacy"
-                            overflow_report["quick_fallback"] = True
+                            overflow_report["opencode_fallback"] = True
+                            overflow_report["template_not_applied"] = True
+                            try:
+                                _g0 = _gate()
+                                if _g0:
+                                    _g0.stamp_office_keywords(path, {"ubm-engine": "legacy"})
+                                    _g0.monitor_log({"kind": "runtime", "template": params.get("theme"), "path": path,
+                                                     "ok": False, "engine": "legacy", "why": _fb_reason})
+                            except Exception:
+                                pass
                             if _fb_reason:
-                                overflow_report["quick_fallback_reason"] = _fb_reason
+                                overflow_report["opencode_fallback_reason"] = _fb_reason
                             if _fb_job:
-                                overflow_report["quick_job"] = _fb_job
-                            if _fb_hop:
-                                overflow_report["hop"] = _fb_hop
-                    # else: quick success; skip legacy family renderer
+                                overflow_report["opencode_job"] = _fb_job
+                elif engine in ("quick", "rejected_quick"):
+                    # SESSION_REV=2026-10-29-remove-quick: reject — never Mac Quick / silent remap
+                    logger.info("daou-workspace: reject engine=quick (removed)")
+                    return json.dumps(
+                        {
+                            "error": "engine_quick_removed",
+                            "message": (
+                                "engine=quick은 제거되었습니다. "
+                                "engine를 생략하면 기본 OpenCode 화슈(Path A)로 만들거나, "
+                                "간이 엔진이 필요하면 engine=legacy를 쓰세요."
+                            ),
+                            "engine": None,
+                            "hint": "omit engine or engine=opencode | engine=legacy",
+                            "rev": SESSION_REV,
+                        },
+                        ensure_ascii=False,
+                    )
                 else:
                     overflow_report = _write_pptx(
                         path,
@@ -4708,12 +6028,6 @@ def make_document(params: dict, **_kw) -> str:
                     )
                     if isinstance(overflow_report, dict):
                         overflow_report["engine"] = "legacy"
-                        if _is_huashu_specimen_theme(params.get("theme")):
-                            overflow_report["huashu_forced_legacy"] = True
-                            overflow_report["huashu_force_reason"] = (
-                                "huashu specimen slug → legacy DNA "
-                                f"(SESSION_REV={SESSION_REV})"
-                            )
             else:
                 _WRITERS[fmt](path, str(params.get("title") or ""), use_blocks if compact else blocks)
         size = os.path.getsize(path)
@@ -4736,9 +6050,46 @@ def make_document(params: dict, **_kw) -> str:
             if overflow_report.get("quick_job"):
                 result["quick_job"] = overflow_report.get("quick_job")
             if overflow_report.get("hop"):
-                result["hop"] = overflow_report.get("hop")
+                # SESSION_REV=2026-10-26-hop-hide: keep exec host out of model-facing result
+                logger.info("daou_make_document pptx hop=%s", overflow_report.get("hop"))
+                result["reply_rule"] = "완료 답에 실행 장비(Mac·맥스튜디오·VPS·hop) 이름 쓰지 말 것. 엔진은 「Quick 엔진」까지만."
+            if overflow_report.get("opencode_fallback"):
+                result["opencode_fallback"] = True
+                if overflow_report.get("opencode_fallback_reason"):
+                    result["opencode_fallback_reason"] = overflow_report.get("opencode_fallback_reason")
+                if overflow_report.get("opencode_job"):
+                    result["opencode_job"] = overflow_report.get("opencode_job")
+                result["reply_rule"] = (
+                    "완료 답에 실행 장비(Mac·맥스튜디오·VPS·hop) 이름 쓰지 말 것. "
+                    "OpenCode Path A 실패로 보조 엔진 결과일 수 있음 — 「Quick 엔진」이라고 쓰지 말 것. "
+                    "엔진은 「화슈/OpenCode」또는 생략. 이후 재촉·같은 요청 재전송이 와도 다시 생성하지 말 것."
+                )
+            if overflow_report.get("template_not_applied"):
+                # TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): never silent — tell the user the template was NOT applied.
+                result["template_not_applied"] = True
+                result["notice"] = "⚠️ 템플릿 미적용: 요청한 템플릿 엔진(OpenCode)이 실패해 보조 엔진(기본 디자인)으로 만든 파일입니다."
+                result["reply_rule"] = (
+                    "HARD: 완료 답 첫 줄에 「⚠️ 템플릿 미적용」과 notice 문장을 그대로 쓸 것(템플릿이 적용된 것처럼 말하지 말 것). "
+                    "템플릿 적용본이 늦게 완성되면 같은 방에 자동으로 다시 보내드린다고 한 줄 덧붙일 것. "
+                    "실행 장비(Mac·VPS·hop) 이름 쓰지 말 것. 재촉이 와도 다시 생성하지 말 것."
+                )
+            if overflow_report.get("path_a"):
+                result["path_a"] = True
+                result["export"] = overflow_report.get("export") or "export_deck_pptx.mjs"
+                if overflow_report.get("opencode_job"):
+                    result["opencode_job"] = overflow_report.get("opencode_job")
+                result["reply_rule"] = (
+                    "완료 답에 실행 장비(Mac·맥스튜디오·VPS·hop) 이름 쓰지 말 것. "
+                    "엔진은 「OpenCode 화슈」또는 「화슈 Path A」정도만. Quick/PPT Master라고 쓰지 말 것."
+                )
             if overflow_report.get("quick_fallback"):
                 result["quick_fallback"] = True
+                # SESSION_REV=2026-10-27-dup-request-guard: no false Quick claim on fallback
+                result["reply_rule"] = (
+                    "완료 답에 실행 장비(Mac·맥스튜디오·VPS·hop) 이름 쓰지 말 것. 이번 파일은 기본 엔진 결과라 "
+                    "「Quick 엔진으로 생성」이라고 쓰지 말고 엔진 언급은 생략. 더 다듬은 버전이 나오면 같은 방에 자동 첨부될 수 있다고 한 줄만. "
+                    "이후 재촉·같은 요청 재전송이 와도 다시 생성하지 말 것."
+                )
             if overflow_report.get("quick_fallback_reason"):
                 result["quick_fallback_reason"] = overflow_report.get("quick_fallback_reason")
             if overflow_report.get("huashu_forced_legacy"):
@@ -4748,24 +6099,45 @@ def make_document(params: dict, **_kw) -> str:
                 result["layout"] = overflow_report.get("layout_wired")
             if overflow_report.get("style_recipe"):
                 result["style_recipe"] = overflow_report.get("style_recipe")
+        # SESSION_REV=2026-10-26-slide-count-verify: report actual slide count; never claim N장 when fewer
+        try:
+            import zipfile as _zf, re as _re
+            if str(path).lower().endswith(".pptx"):
+                with _zf.ZipFile(path) as _z:
+                    _sc = sum(1 for _n in _z.namelist() if _re.fullmatch(r"ppt/slides/slide\d+\.xml", _n))
+                result["slide_count"] = _sc
+                _req = params.get("pages")
+                _req_n = int(_req) if _req is not None and str(_req).strip() != "" else None
+                if _req_n and _req_n > 1 and _sc != _req_n:
+                    result["pages_requested"] = _req_n
+                    result["pages_mismatch"] = True
+                    result["reply_rule"] = (
+                        (result.get("reply_rule") or "")
+                        + f" HARD: 실제 생성 장수는 {_sc}장(요청 {_req_n}장). 완료 답에 「{_req_n}장」이라고 쓰지 말 것. "
+                        f"{_req_n}개 level-1 heading + 장당 120자+ 본문으로 daou_make_document를 한 번 다시 호출해 맞추고, "
+                        f"그래도 다르면 실제 장수({_sc}장)를 그대로 알릴 것."
+                    ).strip()
+                    logger.warning("daou_make_document pptx pages_mismatch requested=%s actual=%s", _req_n, _sc)
+        except Exception as _e:  # noqa: BLE001
+            logger.info("daou_make_document slide_count check skipped: %s", _e)
         theme_slug, theme_pal = _resolve_pptx_theme(params.get("theme"))
-        if eng == "quick":
-            # Quick path: report wire theme/style/layout/canvas as-is (no family remap).
+        if eng in ("opencode",):
+            # OpenCode Path A: report wire theme/style/layout/canvas as-is (no family remap).
             raw_theme = (
                 str((overflow_report or {}).get("theme_wired") or "").strip()
                 or str(params.get("theme") or "").strip()
                 or theme_slug
             )
             result["theme"] = raw_theme
-            if params.get("style"):
-                result["style"] = str(params.get("style"))
-            if params.get("layout"):
-                result["layout"] = str(params.get("layout"))
+            if params.get("style") or (overflow_report or {}).get("style_wired"):
+                result["style"] = str(params.get("style") or (overflow_report or {}).get("style_wired"))
+            if params.get("layout") or (overflow_report or {}).get("layout_wired"):
+                result["layout"] = str(params.get("layout") or (overflow_report or {}).get("layout_wired") or "")
             if params.get("canvas"):
                 result["canvas"] = str(params.get("canvas"))
             result["brand_id"] = raw_theme
             if theme_slug != raw_theme:
-                result["theme_resolved_local"] = theme_slug  # LMS palette id only; Mac used wire theme
+                result["theme_resolved_local"] = theme_slug
         else:
             theme_pal, style_id, style_family = _apply_style_to_palette(theme_pal, params.get("style"))
             result["layout_family"] = theme_pal.get("family", "corporate")
@@ -4801,17 +6173,73 @@ def make_document(params: dict, **_kw) -> str:
                 if overflow_report.get("error"):
                     qa["error"] = overflow_report["error"]
                 result["overflow_qa"] = qa
+    try:  # TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): runtime monitor (cheap checks; log + user notice on failure)
+        _g1 = _gate()
+        _tid = None
+        if fmt == "pptx" and isinstance(overflow_report, dict) and overflow_report.get("company_template"):
+            _tid = overflow_report.get("company_template")
+        elif fmt == "docx" and docx_tpl:
+            _tid = docx_tpl
+        elif fmt == "hwpx" and hwpx_tpl:
+            _tid = hwpx_tpl
+        if _g1 and _tid and not result.get("template_not_applied"):
+            _rc = _g1.runtime_check(path, _tid)
+            result["template_check"] = "pass" if _rc.get("ok") else "fail"
+            if not _rc.get("ok"):
+                result["template_not_applied"] = True
+                result["notice"] = f"⚠️ 템플릿 미적용 가능성: 생성 파일이 템플릿({_tid}) 검사를 통과하지 못했습니다."
+                result["reply_rule"] = ((result.get("reply_rule") or "") +
+                                        " HARD: 완료 답 첫 줄에 notice 문장(⚠️ 템플릿 미적용 …)을 그대로 쓸 것.").strip()
+        elif fmt in ("docx", "hwpx") and (docx_tpl_err or hwpx_tpl_err):
+            result["template_not_applied"] = True
+            result["notice"] = "⚠️ 템플릿 미적용: 템플릿 렌더러 실패로 기본 서식 파일입니다."
+            if _g1:
+                _g1.monitor_log({"kind": "runtime", "template": params.get("template"), "path": path, "ok": False,
+                                 "why": (docx_tpl_err or hwpx_tpl_err)})
+    except Exception as _e:  # noqa: BLE001
+        logger.info("daou-workspace: template monitor skipped: %s", _e)
     if pages is not None:
         result["pages"] = pages
     if page_count is not None:
         result["page_count"] = page_count
     if compact:
         result["page_qc"] = page_qc
+    if fmt == "docx":
+        if docx_tpl:
+            result["template"] = docx_tpl
+            result["template_engine"] = "ubm-render-docx"
+        if docx_tpl_err:
+            result["template_error"] = docx_tpl_err
+    if fmt == "hwpx":
+        if hwpx_tpl:
+            result["template"] = hwpx_tpl
+            result["template_engine"] = "ubm-render-hwpx"
+        if hwpx_tpl_err:
+            result["template_error"] = hwpx_tpl_err
     return json.dumps(result, ensure_ascii=False)
+
+
+def _gate_recover_loop():
+    import time as _t
+    _t.sleep(20)
+    while True:
+        try:
+            g = _gate()
+            if g:
+                for r in g.recover_pending(lambda c, t: _opencode_ssh(c, timeout=t),
+                                           lambda a, b, t: _opencode_scp_from(a, b, timeout=t)):
+                    if r.get("state") not in ("running",):
+                        logger.info("daou-workspace: orphan recovery %s", r)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("daou-workspace: orphan recovery error: %s", e)
+        _t.sleep(60)
 
 
 def register(ctx):
     os.makedirs(WORK_ROOT, mode=0o755, exist_ok=True)
+    if os.environ.get("UBM_GATE_RECOVERY", "1") != "0":
+        import threading as _th
+        _th.Thread(target=_gate_recover_loop, name="ubm-gate-recover", daemon=True).start()
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
