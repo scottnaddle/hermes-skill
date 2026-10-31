@@ -120,6 +120,12 @@ def _scp_remote(hop: str, remote_path: str) -> str:
 def _health_check(hop: str) -> bool:
     """True when SSH works and (if reachable) API answers without auth failure on /health or /v1/models."""
     cfg = _hop_cfg(hop)
+    missing = [k for k in ("host", "api") if not cfg.get(k)]
+    if missing:
+        env = {"mac": "DAOU_MAC", "vps185": "DAOU_FALLBACK"}.get(hop, hop)
+        logger.error("daou-mac: hop %s unconfigured — set %s in unit env (no hardcoded host default)",
+                     hop, ", ".join(f"{env}_{k.upper()}" for k in missing))
+        return False
     try:
         r = subprocess.run(
             ["ssh", "-n", *_SSH_BASE, "-o", f"ConnectTimeout={max(1, int(HEALTH_TIMEOUT))}", cfg["host"], "true"],
@@ -172,6 +178,17 @@ def _select_hop() -> str:
     # last resort: still return fallback so start errors surface from 185
     logger.error("daou-mac: both hops unhealthy; using %s", FALLBACK)
     return FALLBACK
+
+
+
+# DOCS-SERVER (SESSION_REV=2026-10-30-docs-server): Scott — Mac Studio is video-only.
+# docx/hwpx/xlsx/pptx/slides never go to daou_mac_content (no silent Mac path).
+_DOC_RE = re.compile(r"(?i)(\.?(hwpx|hwp|docx|xlsx|pptx)\b|한글\s*(문서|파일)|워드|엑셀|슬라이드|발표\s*자료|프레젠테이션|공문|보고서|계획서|보도자료|ppt-master|ubion-presentation)")
+_MEDIA_RE = re.compile(r"(?i)(영상|비디오|video|mp4|mov|쇼츠|숏폼|shorts|음성|나레이션|tts|자막|srt|받아쓰기|이미지|썸네일|포스터|삽화|화이트보드|모션|lemo|hyperframes)")
+
+
+def _is_doc_request(request: str) -> bool:
+    return bool(_DOC_RE.search(request or "")) and not _MEDIA_RE.search(request or "")
 
 
 class _Slot:
@@ -266,7 +283,7 @@ def _prompt(request: str, job: str, inputs: list[str], hop: str) -> str:
     lines.append(
         "[TTS HARD] 한국어 사내·나레이션·영상 VO는 VoxCPM2만. "
         "호스트에 /opt/voxcpm2/run.sh 있으면 로컬(또는 tools/tts_vox.sh). "
-        "없으면 VOX_HOST=<fallback-host> 로 hop. "
+        "없으면 VOX_HOST=<DAOU_FALLBACK_HOST> 로 hop. "
         "edge-tts/Edge Neural 사내·상업 금지. MiniMax는 키 있을 때만(키 값 출력 금지)."
     )
     req_l = (request or "").lower()
@@ -452,6 +469,10 @@ def mac_content(params: dict, session_id: str = "", **_kw) -> str:
     request = str(params.get("request") or "").strip()
     if len(request) < 4:
         return _err("request 에 만들 내용을 구체적으로 적어 주세요.")
+    if _is_doc_request(request):
+        logger.warning("daou-mac: refused doc job (docs-server rule): %s", request[:120])
+        return _err("문서(워드·한글·엑셀·슬라이드)는 맥스튜디오로 보내지 않아요. daou_make_document(서버 렌더러/OpenCode)로 만드세요. "
+                    "서버 생성이 실패했다면 그 오류를 사용자에게 그대로 알리고 Mac으로 우회하지 마세요.")
     inputs = []
     for raw in params.get("inputs") or []:
         p = os.path.realpath(str(raw))
@@ -533,7 +554,7 @@ CONTENT_SCHEMA = {
     "description": (
         "콘텐츠 작업자(맥스튜디오 우선, 장애 시 VPS185 자동 폴백)에게 파일 제작을 맡긴다: 한국어 음성/나레이션(TTS), "
         "음성·영상 받아쓰기(자막 srt), 숏폼 세로 영상(쇼츠), 이미지 생성(포스터·삽화·썸네일), 영상 편집·자막 입히기, "
-        "한글 hwpx 문서, 로컬 LLM 요약·번역(기밀 자료). 결과 파일은 이 방 작업 폴더의 mac-<job>/ 로 받아 와서 경로를 돌려준다 — "
+        "로컬 LLM 요약·번역(기밀 자료). 문서(docx/hwpx/xlsx/pptx·슬라이드)는 절대 금지 — daou_make_document 사용. 결과 파일은 이 방 작업 폴더의 mac-<job>/ 로 받아 와서 경로를 돌려준다 — "
         "답변에 그 절대 경로를 적으면 방에 첨부된다. 응답 JSON의 hop 필드로 mac|vps185 확인. "
         "음성 1분 이내 ~1분, 이미지 ~1분, 숏폼 30초 ~5~8분 걸림. "
         "기본 wait 90초. running이면 job_id만 주고 턴 종료—어댑터 follow가 배달. 같은 턴에서 daou_mac_status 반복 금지(메시지가 끊김)."

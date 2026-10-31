@@ -1448,9 +1448,17 @@ def _quick_sidecar(
     }
 
 
+def _opencode_host() -> str:
+    """OpenCode hop host from env only (DAOU_OPENCODE_HOST, else DAOU_FALLBACK_HOST). No hardcoded IP."""
+    host = (os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "").strip()
+    if not host:
+        raise RuntimeError("opencode hop unconfigured: set DAOU_OPENCODE_HOST or DAOU_FALLBACK_HOST in the unit env")
+    return host
+
+
 def _opencode_ssh(cmd: str, timeout: int = 120) -> str:
     """SSH to OpenCode hop (default VPS185; Mac Studio later via DAOU_OPENCODE_HOST)."""
-    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    host = _opencode_host()
     key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
     r = subprocess.run(
         ["ssh", "-n", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, cmd],
@@ -1464,7 +1472,7 @@ def _opencode_ssh(cmd: str, timeout: int = 120) -> str:
 
 
 def _opencode_scp_to(local_paths: list[str], remote_dir: str, timeout: int = 120) -> None:
-    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    host = _opencode_host()
     key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
     dst = f"{host}:{remote_dir.rstrip('/')}/"
     r = subprocess.run(
@@ -1478,7 +1486,7 @@ def _opencode_scp_to(local_paths: list[str], remote_dir: str, timeout: int = 120
 
 
 def _opencode_scp_from(remote_path: str, local_path: str, timeout: int = 120) -> None:
-    host = os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "root@185.215.180.212"
+    host = _opencode_host()
     key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
     src = f"{host}:{remote_path}"
     r = subprocess.run(
@@ -1762,7 +1770,7 @@ def _opencode_sidecar(
                 _ct_r = subprocess.run(
                     ["scp", "-q", "-r", "-i", os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519",
                      "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", _ct_dir,
-                     f"{os.environ.get('DAOU_OPENCODE_HOST') or os.environ.get('DAOU_FALLBACK_HOST') or 'root@185.215.180.212'}:{remote_job}/template"],
+                     f"{_opencode_host()}:{remote_job}/template"],
                     capture_output=True, text=True, timeout=120)
                 if _ct_r.returncode != 0:
                     logger.warning("daou-workspace: company template upload failed: %s", _ct_r.stderr[-300:])
