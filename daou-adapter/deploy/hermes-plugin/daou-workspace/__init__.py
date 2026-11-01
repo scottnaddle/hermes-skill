@@ -12,7 +12,7 @@ are built by ``daou_make_document`` from structured blocks, never from code.
 
 from __future__ import annotations
 
-SESSION_REV = "2026-10-31-shiraki-styles"
+SESSION_REV = "2026-11-01-opencode-mac"
 
 import json
 import logging
@@ -1448,17 +1448,54 @@ def _quick_sidecar(
     }
 
 
-def _opencode_host() -> str:
-    """OpenCode hop host from env only (DAOU_OPENCODE_HOST, else DAOU_FALLBACK_HOST). No hardcoded IP."""
-    host = (os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "").strip()
-    if not host:
-        raise RuntimeError("opencode hop unconfigured: set DAOU_OPENCODE_HOST or DAOU_FALLBACK_HOST in the unit env")
-    return host
+import threading as _oc_threading
+
+_OC_TLS = _oc_threading.local()  # per-job hop override (mac → vps185 fallback)
 
 
-def _opencode_ssh(cmd: str, timeout: int = 120) -> str:
-    """SSH to OpenCode hop (default VPS185; Mac Studio later via DAOU_OPENCODE_HOST)."""
-    host = _opencode_host()
+def _opencode_target() -> str:
+    """OPENCODE-MAC-SWITCH: DAOU_OPENCODE_TARGET=vps185|mac (default vps185). Thread-local override wins."""
+    t = getattr(_OC_TLS, "target", None) or (os.environ.get("DAOU_OPENCODE_TARGET") or "vps185").strip().lower()
+    return "mac" if t == "mac" else "vps185"
+
+
+def _opencode_profile(target: str | None = None) -> dict:
+    """Per-target paths. mac: DAOU_MAC_HOST + DAOU_MAC_WORK; vps185: DAOU_OPENCODE_HOST/DAOU_FALLBACK_HOST (env only)."""
+    t = target or _opencode_target()
+    if t == "mac":
+        mw = (os.environ.get("DAOU_MAC_WORK") or "").rstrip("/")
+        xdg = os.environ.get("DAOU_OPENCODE_MAC_XDG") or (f"{mw}/opencode-xdg" if mw else "")
+        return {
+            "target": "mac",
+            "host": (os.environ.get("DAOU_OPENCODE_MAC_HOST") or os.environ.get("DAOU_MAC_HOST") or "").strip(),
+            "work": os.environ.get("DAOU_OPENCODE_MAC_WORK") or (f"{mw}/opencode-jobs" if mw else ""),
+            "skill": f"{xdg}/opencode/skills/huashu-design" if xdg else "",
+            "bin": os.environ.get("DAOU_OPENCODE_MAC_BIN") or "/opt/homebrew/bin/opencode",
+            "xdg": xdg,
+            "dsenv": f"{xdg}/opencode/deepseek.env" if xdg else "",
+        }
+    return {
+        "target": "vps185",
+        "host": (os.environ.get("DAOU_OPENCODE_HOST") or os.environ.get("DAOU_FALLBACK_HOST") or "").strip(),
+        "work": os.environ.get("DAOU_OPENCODE_WORK") or "/root/ubion-bot-work/opencode-jobs",
+        "skill": os.environ.get("DAOU_OPENCODE_HUASHU") or "/root/.config/opencode/skills/huashu-design",
+        "bin": os.environ.get("DAOU_OPENCODE_BIN") or "/root/.local/bin/opencode",
+        "xdg": "",
+        "dsenv": "/root/.config/opencode/deepseek.env",
+    }
+
+
+def _opencode_host(target: str | None = None) -> str:
+    """OpenCode hop host from env only (no hardcoded IP); target via DAOU_OPENCODE_TARGET."""
+    p = _opencode_profile(target)
+    if not p["host"]:
+        raise RuntimeError(f"opencode hop unconfigured (target={p['target']}): set DAOU_MAC_HOST / DAOU_OPENCODE_HOST / DAOU_FALLBACK_HOST")
+    return p["host"]
+
+
+def _opencode_ssh(cmd: str, timeout: int = 120, target: str | None = None) -> str:
+    """SSH to OpenCode hop (target: mac|vps185; default = current target)."""
+    host = _opencode_host(target)
     key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
     r = subprocess.run(
         ["ssh", "-n", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, cmd],
@@ -1485,8 +1522,8 @@ def _opencode_scp_to(local_paths: list[str], remote_dir: str, timeout: int = 120
         raise RuntimeError(f"opencode-scp-to fail: {(r.stderr or '')[-300:]}")
 
 
-def _opencode_scp_from(remote_path: str, local_path: str, timeout: int = 120) -> None:
-    host = _opencode_host()
+def _opencode_scp_from(remote_path: str, local_path: str, timeout: int = 120, target: str | None = None) -> None:
+    host = _opencode_host(target)
     key = os.environ.get("DAOU_OPENCODE_KEY") or "/etc/hermes-mac/id_ed25519"
     src = f"{host}:{remote_path}"
     r = subprocess.run(
@@ -1670,7 +1707,7 @@ def _blocks_to_opencode_brief(title: str, blocks: list) -> str:
     return "\n".join(lines).strip()[:14000]
 
 
-def _opencode_sidecar(
+def _opencode_sidecar_one(
     path: str,
     title: str,
     blocks: list,
@@ -1724,14 +1761,15 @@ def _opencode_sidecar(
     layout_v = (str(layout).strip() if layout else "") or ""
     deck_v = (str(deck).strip() if deck else "") or ""
 
-    work_root = os.environ.get("DAOU_OPENCODE_WORK") or "/root/ubion-bot-work/opencode-jobs"
+    _ocp = _opencode_profile()
+    work_root = _ocp["work"]
     job = f"oc-{_time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     remote_job = f"{work_root.rstrip('/')}/{job}"
     remote_work = f"{remote_job}/work"
     remote_out = f"{remote_job}/out"
     remote_pptx = f"{remote_out}/deck.pptx"
-    skill_dir = os.environ.get("DAOU_OPENCODE_HUASHU") or "/root/.config/opencode/skills/huashu-design"
-    oc_bin = os.environ.get("DAOU_OPENCODE_BIN") or "/root/.local/bin/opencode"
+    skill_dir = _ocp["skill"]
+    oc_bin = _ocp["bin"]
 
     # TEMPLATE-GATE (SESSION_REV=2026-10-30-template-gate): prompt built by _opencode_build_prompt (SKILL inlined, defaults stripped)
     prompt, _ct_dir, _pmeta = _opencode_build_prompt(
@@ -1797,13 +1835,16 @@ OUT_DIR = pathlib.Path(__OUT_DIR__)
 OC = __OC__
 
 def main() -> int:
+    (OUT_DIR.parent / "RUNNER.pid").write_text(str(os.getpid()))
     oc = OC
     if not (os.path.isfile(oc) and os.access(oc, os.X_OK)):
         oc = shutil.which("opencode") or OC
     prompt = PROMPT.read_text(encoding="utf-8")
     env = os.environ.copy()
     env["SKIP_DESIGN_GATE"] = "1"
-    ds = pathlib.Path("/root/.config/opencode/deepseek.env")
+    if __XDG__:
+        env["XDG_CONFIG_HOME"] = __XDG__
+    ds = pathlib.Path(__DSENV__)
     if ds.is_file():
         for line in ds.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -1815,19 +1856,27 @@ def main() -> int:
             env[k.strip()] = v.strip().strip('"').strip("'")
     with LOG.open("w", encoding="utf-8") as log:
         try:
-            r = subprocess.run(
+            p = subprocess.Popen(
                 [oc, "run", "--auto", "-m", "deepseek/deepseek-flash", prompt],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                timeout=WAIT,
                 env=env,
                 cwd=str(WORK),
+                start_new_session=True,
             )
-            code = r.returncode
+            (OUT_DIR.parent / "OC.pid").write_text(str(p.pid))
+            code = p.wait(timeout=WAIT)
         except subprocess.TimeoutExpired:
             log.write("TIMEOUT" + chr(10))
+            try:
+                os.killpg(p.pid, 15)
+            except Exception:
+                pass
             code = 124
+    if (OUT_DIR.parent / "CANCELLED").exists():  # OC-JOBSTATE: superseded attempt -> never publish a deck
+        (OUT_DIR.parent / "EXIT").write_text("130")
+        return 130
     if not OUT.is_file():
         cands = list(WORK.rglob("*.pptx")) + list(OUT_DIR.rglob("*.pptx"))
         if cands:
@@ -1853,6 +1902,8 @@ if __name__ == "__main__":
         .replace("__WORK__", repr(remote_work))
         .replace("__OUT_DIR__", repr(remote_out))
         .replace("__OC__", repr(oc_bin))
+        .replace("__XDG__", repr(_ocp["xdg"]))
+        .replace("__DSENV__", repr(_ocp["dsenv"]))
     )
     with tempfile.TemporaryDirectory(prefix="oc-runner-") as td2:
         runner_path = os.path.join(td2, "run_opencode_job.py")
@@ -1874,16 +1925,22 @@ if __name__ == "__main__":
     # job; a gateway restart leaves a pending record that _gate_recover_loop delivers later.
     remote_cmd = (
         f"chmod +x {shlex.quote(remote_job + '/run_opencode_job.py')} && "
-        f"cd {shlex.quote(remote_job)} && (setsid nohup python3 run_opencode_job.py > runner.out 2>&1 < /dev/null &) && echo started"
+        f"cd {shlex.quote(remote_job)} && (if command -v setsid >/dev/null 2>&1; then setsid nohup python3 run_opencode_job.py; else nohup python3 run_opencode_job.py; fi > runner.out 2>&1 < /dev/null &) && echo started"
     )
     _g = _gate()
     _room = os.path.basename(os.path.dirname(path))
     if _g:
         try:
             _g.pending_add({"job": job, "remote_job": remote_job, "remote_pptx": remote_pptx, "path": path,
-                            "room": _room, "theme": theme_v if _ct_dir else None, "theme_raw": theme_v})
+                            "room": _room, "theme": theme_v if _ct_dir else None, "theme_raw": theme_v,
+                            "lj": getattr(_OC_TLS, "lj", None) or job, "target": _ocp["target"],
+                            "attempt": getattr(_OC_TLS, "attempt", 1)})
         except Exception as e:  # noqa: BLE001
             logger.warning("daou-workspace: pending record failed: %s", e)
+    try:
+        _oc_attempt(getattr(_OC_TLS, "lj", None) or job, _ocp["target"], job, remote_job, "running")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("daou-workspace: jobstate failed: %s", e)
     try:
         _opencode_ssh(remote_cmd, timeout=60)
     except Exception as e:
@@ -1892,7 +1949,7 @@ if __name__ == "__main__":
             _g.pending_done(job, "launch_failed")
         return {
             "engine": "opencode", "opencode_fallback": True, "opencode_fallback_reason": f"launch:{str(e)[:300]}",
-            "opencode_job": job, "hop": "opencode", "rev": SESSION_REV, "company_template": _ct_dir and theme_v,
+            "opencode_job": job, "opencode_remote_job": remote_job, "hop": "opencode", "rev": SESSION_REV, "company_template": _ct_dir and theme_v,
         }
     _deadline = t0 + wait + 90
     _ssh_err_since = None
@@ -1915,7 +1972,7 @@ if __name__ == "__main__":
             break
     if "DECK" not in _state:
         logger.warning("daou-workspace: opencode run no deck job=%s state=%r", job, _state[-80:])
-        if _g:
+        if _g and _ocp["target"] != "mac":  # mac: wrapper supersedes + falls back to vps185 (OC-JOBSTATE)
             try:  # job may still finish: let the recovery loop deliver it (marked orphan)
                 _rec = _g._load(_g.PENDING_DIR / f"{job}.json", None)
                 if _rec is not None:
@@ -1928,6 +1985,7 @@ if __name__ == "__main__":
             "opencode_fallback": True,
             "opencode_fallback_reason": f"run:no_deck state={_state[-60:]!r}",
             "opencode_job": job,
+            "opencode_remote_job": remote_job,
             "hop": "opencode",
             "elapsed_s": round(_time.time() - t0, 1),
             "rev": SESSION_REV,
@@ -1954,6 +2012,7 @@ if __name__ == "__main__":
             "opencode_fallback": True,
             "opencode_fallback_reason": f"fetch:{str(e)[:300]}",
             "opencode_job": job,
+            "opencode_remote_job": remote_job,
             "hop": "opencode",
             "elapsed_s": round(_time.time() - t0, 1),
             "rev": SESSION_REV,
@@ -1961,6 +2020,13 @@ if __name__ == "__main__":
 
     if not _ct_dir:  # SHIRAKI-STYLES: theme major/minor latin+ea = S-Core Dream (run fonts already are)
         _pptx_force_theme_fonts(path)
+    _lj = getattr(_OC_TLS, "lj", None) or job
+    try:
+        if not _oc_claim_delivery(_lj, job, _ocp["target"], "in_turn"):
+            logger.warning("daou-workspace: opencode lj=%s already claimed before in-turn job=%s", _lj, job)
+        _oc_attempt(_lj, _ocp["target"], job, remote_job, "delivered")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("daou-workspace: jobstate deliver mark failed: %s", e)
     if _g:
         _g.pending_done(job, "delivered_in_turn")
         _g.stamp_office_keywords(path, {"ubm-engine": "opencode-patha", "ubm-template": theme_v if _ct_dir else ""})
@@ -6227,17 +6293,241 @@ def make_document(params: dict, **_kw) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+# --- OC-JOBSTATE (SESSION_REV=2026-11-01-opencode-mac) --------------------------------------------
+# One logical job (lj) per sidecar call; attempts (mac → vps185) recorded in STATE_DIR/oc-jobs/<lj>.json.
+# Delivery is idempotent per lj: STATE_DIR/oc-delivered/<lj>.json is created O_EXCL by whoever delivers first.
+
+def _oc_state_dir() -> Path:
+    g = _gate()
+    return Path(getattr(g, "STATE_DIR", None) or os.environ.get("UBM_GATE_STATE") or "/var/lib/ubm-template-gate")
+
+
+def _oc_jobstate(lj: str) -> dict:
+    try:
+        return json.loads((_oc_state_dir() / "oc-jobs" / f"{lj}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _oc_attempt(lj: str, target: str, job: str, remote_job: str, status: str) -> dict:
+    import fcntl
+    import time as _t
+    d = _oc_state_dir() / "oc-jobs"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{lj}.json"
+    with open(d / ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        st = _oc_jobstate(lj) or {"lj": lj, "created": _t.time(), "attempts": []}
+        a = next((x for x in st["attempts"] if x.get("job") == job), None)
+        if a is None:
+            a = {"n": len(st["attempts"]) + 1, "job": job, "target": target, "remote_job": remote_job}
+            st["attempts"].append(a)
+            st["owner"] = job  # latest attempt owns the job
+        a["status"] = status
+        a["ts"] = _t.time()
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    return st
+
+
+def _oc_delivered(lj: str) -> dict | None:
+    try:
+        return json.loads((_oc_state_dir() / "oc-delivered" / f"{lj}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _oc_claim_delivery(lj: str, job: str, target: str, how: str) -> bool:
+    import time as _t
+    d = _oc_state_dir() / "oc-delivered"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(d / f"{lj}.json"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"lj": lj, "job": job, "target": target, "how": how, "ts": _t.time()}, fh)
+    return True
+
+
+def _oc_unclaim_delivery(lj: str, job: str) -> None:
+    rec = _oc_delivered(lj)
+    if rec and rec.get("job") == job:
+        try:
+            (_oc_state_dir() / "oc-delivered" / f"{lj}.json").unlink()
+        except OSError:
+            pass
+
+
+def _oc_cancel_remote(target: str, remote_job: str) -> None:
+    """Mark CANCELLED and kill the remote runner + opencode process group (best effort)."""
+    if not remote_job:
+        return
+    q = shlex.quote(remote_job)
+    cmd = (f"touch {q}/CANCELLED; for f in OC RUNNER; do p=$(cat {q}/$f.pid 2>/dev/null); "
+           f"[ -n \"$p\" ] && {{ kill -TERM -- -$p 2>/dev/null; pkill -TERM -P $p 2>/dev/null; kill -TERM $p 2>/dev/null; }}; done; "
+           f"rm -f {q}/out/deck.pptx; echo cancelled")
+    try:
+        _opencode_ssh(cmd, timeout=30, target=target)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("daou-workspace: opencode cancel %s %s failed: %s", target, remote_job, str(e)[:160])
+
+
+def _oc_supersede(lj: str, target: str, job: str, remote_job: str, why: str) -> None:
+    _oc_attempt(lj, target, job, remote_job, "superseded")
+    _oc_cancel_remote(target, remote_job)
+    g = _gate()
+    if g:
+        try:
+            g.pending_done(job, f"superseded:{why}"[:120])
+        except Exception:  # noqa: BLE001
+            pass
+    logger.warning("daou-workspace: opencode lj=%s attempt job=%s on %s superseded (%s)", lj, job, target, why)
+
+
+def _opencode_sidecar(*args, **kwargs) -> dict | None:
+    """OPENCODE-MAC-SWITCH: run on DAOU_OPENCODE_TARGET (default vps185); mac failure → retry on vps185.
+
+    OC-JOBSTATE: single owner per logical job; the failed mac attempt is superseded (remote killed, pending closed)
+    before the vps185 attempt starts, so recovery can never deliver it."""
+    import uuid
+    target = _opencode_target()
+    lj = f"lj-{uuid.uuid4().hex[:12]}"
+    _OC_TLS.target, _OC_TLS.lj, _OC_TLS.attempt = target, lj, 1
+    try:
+        res = _opencode_sidecar_one(*args, **kwargs)
+    finally:
+        _OC_TLS.target = None
+    if isinstance(res, dict):
+        res.setdefault("opencode_target", target)
+        res["opencode_lj"] = lj
+    if target == "mac" and isinstance(res, dict) and res.get("opencode_fallback"):
+        logger.warning("daou-workspace: opencode mac hop failed (%s) → vps185", res.get("opencode_fallback_reason"))
+        if res.get("opencode_job"):
+            _oc_supersede(lj, "mac", res["opencode_job"], res.get("opencode_remote_job") or "", "fallback_vps185")
+        _OC_TLS.target, _OC_TLS.attempt = "vps185", 2
+        try:
+            res2 = _opencode_sidecar_one(*args, **kwargs)
+        finally:
+            _OC_TLS.target = None
+            _OC_TLS.lj = None
+        if isinstance(res2, dict):
+            res2["opencode_target"] = "vps185"
+            res2["opencode_lj"] = lj
+            res2["opencode_mac_fail"] = str(res.get("opencode_fallback_reason"))[:200]
+        return res2
+    _OC_TLS.lj = None
+    return res
+
+
+def _oc_recover_pending(max_age_s: int = 3 * 3600, deliver=None) -> list[dict]:
+    """Host-aware orphan recovery: each pending record is checked on the host recorded in it (mac | vps185).
+
+    Only the owner (latest) attempt of a logical job may deliver, and only once (oc-delivered claim)."""
+    import time
+    g = _gate()
+    out: list[dict] = []
+    if not g or not g.PENDING_DIR.is_dir():
+        return out
+    deliver = deliver or g.bot_send_file
+    for p in sorted(g.PENDING_DIR.glob("*.json")):
+        rec = g._load(p, None)
+        if not rec:
+            continue
+        if g._pid_alive(rec.get("pid")) and rec.get("pid") != os.getpid():
+            continue
+        if rec.get("pid") == os.getpid() and not rec.get("orphan"):
+            continue
+        job = rec.get("job")
+        lj = rec.get("lj") or job
+        tgt = rec.get("target") or "vps185"
+        claim = p.with_suffix(".claim")
+        try:
+            os.rename(p, claim)
+        except OSError:
+            continue
+        st = _oc_jobstate(lj)
+        owner = st.get("owner") or job
+        if owner != job or _oc_delivered(lj):
+            why = "superseded" if owner != job else "already_delivered"
+            os.replace(claim, p)
+            if owner != job:
+                _oc_cancel_remote(tgt, rec.get("remote_job") or "")
+            _oc_attempt(lj, tgt, job, rec.get("remote_job") or "", f"discarded:{why}")
+            g.pending_done(job, f"discarded:{why}")
+            logger.info("daou-workspace: recovery discarded job=%s lj=%s host=%s (%s)", job, lj, tgt, why)
+            out.append({"job": job, "lj": lj, "target": tgt, "state": f"discarded_{why}"})
+            continue
+        age = time.time() - float(rec.get("created") or 0)
+        try:
+            s = _opencode_ssh(f"test -s {shlex.quote(rec['remote_pptx'])} && echo DECK || "
+                              f"(test -f {shlex.quote(rec['remote_job'])}/EXIT && echo EXIT || echo RUN)",
+                              timeout=30, target=tgt).strip()
+        except Exception as e:  # noqa: BLE001
+            os.rename(claim, p)
+            out.append({"job": job, "target": tgt, "state": "ssh_error", "err": str(e)[:120]})
+            continue
+        if s.endswith("RUN") and age < max_age_s:
+            rec["orphan"] = True
+            g._save(p, rec)
+            claim.unlink(missing_ok=True)
+            out.append({"job": job, "target": tgt, "state": "running"})
+            continue
+        if not s.endswith("DECK"):
+            g._save(claim, rec)
+            os.replace(claim, p)
+            _oc_attempt(lj, tgt, job, rec.get("remote_job") or "", "failed_no_deck")
+            g.pending_done(job, "failed_no_deck")
+            g.monitor_log({"kind": "orphan", "template": rec.get("theme"), "job": job, "ok": False, "why": "no deck",
+                           "target": tgt})
+            out.append({"job": job, "target": tgt, "state": "no_deck"})
+            continue
+        if not _oc_claim_delivery(lj, job, tgt, "recovery"):
+            os.replace(claim, p)
+            g.pending_done(job, "discarded:already_delivered")
+            out.append({"job": job, "lj": lj, "target": tgt, "state": "discarded_already_delivered"})
+            continue
+        local = rec["path"]
+        if os.path.exists(local):
+            root, ext = os.path.splitext(local)
+            local = f"{root}-template{ext}"
+        try:
+            _opencode_scp_from(rec["remote_pptx"], local, timeout=120, target=tgt)
+            os.chmod(local, 0o644)
+            g.stamp_office_keywords(local, {"ubm-engine": "opencode-patha", "ubm-template": rec.get("theme") or ""})
+        except Exception as e:  # noqa: BLE001
+            _oc_unclaim_delivery(lj, job)
+            os.replace(claim, p)
+            out.append({"job": job, "target": tgt, "state": "fetch_error", "err": str(e)[:120]})
+            continue
+        chk = g.runtime_check(local, rec.get("theme"), engine_hint="opencode-patha")
+        rid = g.room_id_for_folder(rec.get("room") or "")
+        sent = False
+        if rid and deliver:
+            txt = (f"⚠️ 앞서 보내드린 파일은 템플릿 미적용(보조 엔진) 버전이었거나 전송되지 못했습니다. "
+                   f"템플릿({rec.get('theme') or rec.get('theme_raw')}) 적용본을 다시 보내드립니다.")
+            sent = deliver(rid, local, os.path.basename(local), txt)
+        if not sent:
+            _oc_unclaim_delivery(lj, job)
+        claim.unlink(missing_ok=True)
+        g._save(p, rec)
+        _oc_attempt(lj, tgt, job, rec.get("remote_job") or "", "delivered" if sent else "recovered_not_sent")
+        g.pending_done(job, "delivered" if sent else "recovered_not_sent")
+        g.monitor_log({"kind": "orphan", "template": rec.get("theme"), "job": job, "ok": bool(sent), "target": tgt,
+                       "path": local, "room": rec.get("room"), "check_ok": chk.get("ok")})
+        out.append({"job": job, "lj": lj, "target": tgt, "state": "delivered" if sent else "recovered", "path": local})
+    return out
+
+
 def _gate_recover_loop():
     import time as _t
     _t.sleep(20)
     while True:
         try:
-            g = _gate()
-            if g:
-                for r in g.recover_pending(lambda c, t: _opencode_ssh(c, timeout=t),
-                                           lambda a, b, t: _opencode_scp_from(a, b, timeout=t)):
-                    if r.get("state") not in ("running",):
-                        logger.info("daou-workspace: orphan recovery %s", r)
+            for r in _oc_recover_pending():
+                if r.get("state") not in ("running",):
+                    logger.info("daou-workspace: orphan recovery %s", r)
         except Exception as e:  # noqa: BLE001
             logger.warning("daou-workspace: orphan recovery error: %s", e)
         _t.sleep(60)
